@@ -3,7 +3,7 @@ import re
 
 class mainLLM:
     def __init__(self):
-        self.model = "gemma3:4b"
+        self.model = "gpt-oss:20b-cloud"
     
     def call_llm(self, prompt: str):
         try:
