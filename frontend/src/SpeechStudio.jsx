@@ -120,13 +120,13 @@ export default function SpeechStudio() {
   // ✅ Backend call
   const sendToBackend = async (query) => {
     try {
-      const res = await fetch("http://127.0.0.1:8000/ask/", {
+      const res = await fetch("http://127.0.0.1:8000/query", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: query }),
+        body: JSON.stringify({ mode:1,query: query }),
       });
       const data = await res.json();
-
+      print(data)
       const reply = typeof data.reply === "string" ? data.reply : JSON.stringify(data.reply);
       setMessages((prev) => [...prev, { role: "bot", content: reply }]);
       speakText(reply);

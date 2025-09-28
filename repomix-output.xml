@@ -1,0 +1,2489 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+frontend/
+  public/
+    models/
+      robot/
+        license.txt
+        scene.gltf
+    vite.svg
+  src/
+    assets/
+      react.svg
+    App.css
+    App.jsx
+    index.css
+    main.jsx
+    SpeechStudio.jsx
+  .gitignore
+  index.html
+  package.json
+  postcss.config.cjs
+  README.md
+.gitignore
+agent.py
+api.py
+compressor.py
+helper.py
+LICENSE
+multi_task.py
+README.md
+requirements.txt
+single_task.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="api.py">
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import asyncio
+import json
+import re
+import time
+from agent import mainLLM
+from helper import AsyncHelper  # Changed import
+from compressor import Compressor
+from browser_use import Agent, BrowserProfile, ChatOllama
+
+app = FastAPI(title="Agentic Surfer API",
+              description="Web automation and data extraction API")
+
+# Allow frontend connections
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class QueryRequest(BaseModel):
+    mode: int  # 0 = single_task, 1 = multi_task
+    query: str
+
+class QueryResponse(BaseModel):
+    status: str
+    message: str
+    result: dict | None = None
+    error: str | None = None
+
+
+# ---------- Single Task Agent ----------
+class SimpleAgent(AsyncHelper):  # Now inherits from AsyncHelper
+    def __init__(self):
+        super().__init__()
+        self.tools = {
+            "search_google_safely": {
+                "method": self.search_google_safely,
+                "description": "Search Google for a query and return top results."
+            },
+            "click_result": {
+                "method": self.smart_click,
+                "description": "Click on a search result by context."
+            },
+            "extract_data": {
+                "method": self.extract_visible_content,
+                "description": "Extract visible text from the current page."
+            },
+            "close_browser": {
+                "method": self.close,
+                "description": "Close browser and cleanup."
+            },
+            "get_page_info": {
+                "method": self.get_page_info,
+                "description": "Get current page URL, title and content preview."
+            },
+            "save_results": {
+                "method": self.save_results,
+                "description": "Append results to a local file."
+            }
+        }
+
+    def get_tools_prompt(self) -> str:
+        return "\n".join(
+            f"• {name}: {info['description']}"
+            for name, info in self.tools.items()
+        )
+
+    @staticmethod
+    def parse_json(text: str):
+        """Extract JSON from an LLM response string."""
+        try:
+            clean_text = re.sub(r"[^\x00-\x7F]+", "", text)
+            match = re.search(r"\{[^{}]*\{[^{}]*\}[^{}]*\}|\{[^{}]*\}", clean_text, re.DOTALL)
+            if match:
+                return json.loads(match.group())
+            return {"error": "No valid JSON found in response"}
+        except json.JSONDecodeError as e:
+            return {"error": f"JSON parsing failed: {e}"}
+        except Exception as e:
+            return {"error": f"Unexpected error: {e}"}
+
+
+async def run_single_task(query: str) -> dict:
+    """Run single task mode."""
+    agent = SimpleAgent()
+    await agent.setup()
+    await agent.clear_cookies_and_cache()
+    await agent.rotate_user_agent()
+    mainllm = mainLLM()
+    try:
+        available_tools = agent.get_tools_prompt()
+        plan_json = mainllm.get_action_plan(query, available_tools)
+        action_plan = agent.parse_json(plan_json)
+
+        if "error" in action_plan:
+            return {"error": f"Failed to create action plan: {action_plan['error']}"}
+
+        results = []
+        for idx, step in enumerate(action_plan.get("steps", []), start=1):
+            print(f"\n{idx}. Executing: {step.get('description', 'Unknown step')}")
+            action = step.get("action", "")
+            
+            if action not in agent.tools:
+                print(f"❌ Unknown action: {action}")
+                continue
+
+            method = agent.tools[action]["method"]
+            params = {
+                k: v for k, v in step.items()
+                if k not in {"order", "action", "description", "executed"}
+            }
+            try:
+                if action in {"extract_data", "get_page_info"}:
+                    result = await method()
+                    results.append({"index": idx, "result": result})
+                elif action == "save_results":
+                    result = await method() 
+                    results.append({"index": idx, "result": result})
+                else:
+
+                    result = await method(**params) if params else await method()
+                    results.append({"index": idx, "result": result})
+
+                print(f"✅ Step {idx} completed")
+                
+            except Exception as e:
+                print(f"❌ Error in step {idx}: {e}")
+                results.append({"index": idx, "error": str(e)})
+
+        print("\nAnalyzing final results...")
+        final_content = await agent.extract_visible_content()
+        if not final_content:
+            return {"error": "No content extracted", "steps_executed": len(results)}
+        results_str = "\n".join(
+            f"Step {r['index']}: {r.get('result', r.get('error', 'No result'))}" 
+            for r in results
+        )
+        final_response = mainllm.extract_final_data(results_str, query)
+        return {
+            "response": final_response, 
+            "detailed_results": results
+        }
+
+    except Exception as e:
+        return {"error": f"Error during execution: {e}"}
+    finally:
+        await agent.close() 
+
+
+# ---------- Multi Task Agent ----------
+async def run_multi_task(query: str) -> dict:
+    """Run multi task mode."""
+    try:
+        llm2 = ChatOllama(model="gpt-oss:20b-cloud")
+        browser_profile = BrowserProfile(
+            minimum_wait_page_load_time=0.1,
+            wait_between_actions=0.1,
+            headless=False,
+        )
+        compressor = Compressor()
+
+        print(f"Original Task: {query}")
+        compressed_task = compressor.compress_prompt(query)
+        print(f"Compressed Task: {compressed_task}")
+
+        task = query + (
+            " results in strict JSON format, no text I just strictly need JSON Outputs,"
+            " Use google to check relevance and up to date info"
+        )
+
+        agent = Agent(
+            task=task,
+            llm=llm2,
+            flash_mode=True,
+            browser_profile=browser_profile,
+        )
+
+        history = await agent.run()
+        extracted_content = history.extracted_content()
+        
+        if not extracted_content:
+            return {"error": "No content extracted from multi-task agent"}
+            
+        history = extracted_content[-1]
+        
+        try:
+            return json.loads(history)
+        except json.JSONDecodeError:
+            return {"raw_response": history}
+
+    except Exception as e:
+        return {"error": f"Error in multi-task execution: {e}"}
+
+
+# ---------- Routes ----------
+@app.post("/query", response_model=QueryResponse)
+async def handle_query(request: QueryRequest):
+    """Handle user queries for web automation tasks."""
+    try:
+        if request.mode == 0:
+            result = await run_single_task(request.query)
+            if "error" in result:
+                return QueryResponse(status="error", message=result["error"])
+            return QueryResponse(status="success",
+                               message="Single task completed successfully",
+                               result=result)
+        elif request.mode == 1:
+            result = await run_multi_task(request.query)
+            if "error" in result:
+                return QueryResponse(status="error", message=result["error"])
+            return QueryResponse(status="success",
+                               message="Multi task completed successfully",
+                               result=result)
+        else:
+            raise HTTPException(status_code=400,
+                              detail="Invalid mode. Use 0 for single_task or 1 for multi_task")
+    except Exception as e:
+        return QueryResponse(status="error",
+                           message="An error occurred during processing",
+                           error=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+</file>
+
+<file path="frontend/public/models/robot/license.txt">
+Model Information:
+* title:	Optimus_ Prime_from_th_1008063324_refine
+* source:	https://sketchfab.com/3d-models/optimus--prime-from-th-1008063324-refine-718bb932f33044d48f025e6eae7eb8f0
+* author:	shuiebleiberg522 (https://sketchfab.com/shuiebleiberg522)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Optimus_ Prime_from_th_1008063324_refine" (https://sketchfab.com/3d-models/optimus--prime-from-th-1008063324-refine-718bb932f33044d48f025e6eae7eb8f0) by shuiebleiberg522 (https://sketchfab.com/shuiebleiberg522) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+</file>
+
+<file path="frontend/public/models/robot/scene.gltf">
+{
+  "accessors": [
+    {
+      "bufferView": 2,
+      "componentType": 5126,
+      "count": 65532,
+      "max": [
+        0.7087979912757874,
+        0.9890729784965515,
+        0.3531070053577423
+      ],
+      "min": [
+        -0.7109839916229248,
+        -1.0006400346755981,
+        -0.3183389902114868
+      ],
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 2,
+      "byteOffset": 786384,
+      "componentType": 5126,
+      "count": 65532,
+      "max": [
+        1.0,
+        0.9999998211860657,
+        1.0
+      ],
+      "min": [
+        -1.0,
+        -1.0,
+        -1.0
+      ],
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "count": 65532,
+      "max": [
+        0.99609375,
+        0.998560905456543
+      ],
+      "min": [
+        0.0013513565063476563,
+        0.00146484375
+      ],
+      "type": "VEC2"
+    },
+    {
+      "bufferView": 0,
+      "componentType": 5125,
+      "count": 326160,
+      "type": "SCALAR"
+    },
+    {
+      "bufferView": 2,
+      "byteOffset": 1572768,
+      "componentType": 5126,
+      "count": 60389,
+      "max": [
+        0.7091060280799866,
+        1.0287200212478638,
+        0.35384601354599
+      ],
+      "min": [
+        -0.7108740210533142,
+        -1.000100016593933,
+        -0.355105996131897
+      ],
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 2,
+      "byteOffset": 2297436,
+      "componentType": 5126,
+      "count": 60389,
+      "max": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "min": [
+        -1.0,
+        -0.9999998211860657,
+        -1.0
+      ],
+      "type": "VEC3"
+    },
+    {
+      "bufferView": 1,
+      "byteOffset": 524256,
+      "componentType": 5126,
+      "count": 60389,
+      "max": [
+        0.994140625,
+        0.9986486434936523
+      ],
+      "min": [
+        0.0013513565063476563,
+        0.00146484375
+      ],
+      "type": "VEC2"
+    },
+    {
+      "bufferView": 0,
+      "byteOffset": 1304640,
+      "componentType": 5125,
+      "count": 268308,
+      "type": "SCALAR"
+    }
+  ],
+  "asset": {
+    "extras": {
+      "author": "shuiebleiberg522 (https://sketchfab.com/shuiebleiberg522)",
+      "license": "CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)",
+      "source": "https://sketchfab.com/3d-models/optimus--prime-from-th-1008063324-refine-718bb932f33044d48f025e6eae7eb8f0",
+      "title": "Optimus_ Prime_from_th_1008063324_refine"
+    },
+    "generator": "Sketchfab-16.45.0",
+    "version": "2.0"
+  },
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteLength": 2377872,
+      "name": "floatBufferViews",
+      "target": 34963
+    },
+    {
+      "buffer": 0,
+      "byteLength": 1007368,
+      "byteOffset": 2377872,
+      "byteStride": 8,
+      "name": "floatBufferViews",
+      "target": 34962
+    },
+    {
+      "buffer": 0,
+      "byteLength": 3022104,
+      "byteOffset": 3385240,
+      "byteStride": 12,
+      "name": "floatBufferViews",
+      "target": 34962
+    }
+  ],
+  "buffers": [
+    {
+      "byteLength": 6407344,
+      "uri": "scene.bin"
+    }
+  ],
+  "images": [
+    {
+      "uri": "textures/Material_0_baseColor.jpeg"
+    }
+  ],
+  "materials": [
+    {
+      "doubleSided": true,
+      "name": "Material_0",
+      "pbrMetallicRoughness": {
+        "baseColorTexture": {
+          "index": 0
+        },
+        "metallicFactor": 0.0,
+        "roughnessFactor": 0.8
+      }
+    }
+  ],
+  "meshes": [
+    {
+      "name": "Object_0",
+      "primitives": [
+        {
+          "attributes": {
+            "NORMAL": 1,
+            "POSITION": 0,
+            "TEXCOORD_0": 2
+          },
+          "indices": 3,
+          "material": 0,
+          "mode": 4
+        }
+      ]
+    },
+    {
+      "name": "Object_1",
+      "primitives": [
+        {
+          "attributes": {
+            "NORMAL": 5,
+            "POSITION": 4,
+            "TEXCOORD_0": 6
+          },
+          "indices": 7,
+          "material": 0,
+          "mode": 4
+        }
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "children": [
+        1
+      ],
+      "matrix": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        2.220446049250313e-16,
+        -1.0,
+        0.0,
+        0.0,
+        1.0,
+        2.220446049250313e-16,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "name": "Sketchfab_model"
+    },
+    {
+      "children": [
+        2
+      ],
+      "name": "root"
+    },
+    {
+      "children": [
+        3
+      ],
+      "matrix": [
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        2.220446049250313e-16,
+        1.0,
+        0.0,
+        0.0,
+        -1.0,
+        2.220446049250313e-16,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "name": "GLTF_SceneRootNode"
+    },
+    {
+      "children": [
+        4,
+        5
+      ],
+      "name": "Mesh_0_0"
+    },
+    {
+      "mesh": 0,
+      "name": "Object_4"
+    },
+    {
+      "mesh": 1,
+      "name": "Object_5"
+    }
+  ],
+  "samplers": [
+    {
+      "magFilter": 9729,
+      "minFilter": 9987,
+      "wrapS": 10497,
+      "wrapT": 10497
+    }
+  ],
+  "scene": 0,
+  "scenes": [
+    {
+      "name": "Sketchfab_Scene",
+      "nodes": [
+        0
+      ]
+    }
+  ],
+  "textures": [
+    {
+      "sampler": 0,
+      "source": 0
+    }
+  ]
+}
+</file>
+
+<file path="frontend/public/vite.svg">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" class="iconify iconify--logos" width="31.88" height="32" preserveAspectRatio="xMidYMid meet" viewBox="0 0 256 257"><defs><linearGradient id="IconifyId1813088fe1fbc01fb466" x1="-.828%" x2="57.636%" y1="7.652%" y2="78.411%"><stop offset="0%" stop-color="#41D1FF"></stop><stop offset="100%" stop-color="#BD34FE"></stop></linearGradient><linearGradient id="IconifyId1813088fe1fbc01fb467" x1="43.376%" x2="50.316%" y1="2.242%" y2="89.03%"><stop offset="0%" stop-color="#FFEA83"></stop><stop offset="8.333%" stop-color="#FFDD35"></stop><stop offset="100%" stop-color="#FFA800"></stop></linearGradient></defs><path fill="url(#IconifyId1813088fe1fbc01fb466)" d="M255.153 37.938L134.897 252.976c-2.483 4.44-8.862 4.466-11.382.048L.875 37.958c-2.746-4.814 1.371-10.646 6.827-9.67l120.385 21.517a6.537 6.537 0 0 0 2.322-.004l117.867-21.483c5.438-.991 9.574 4.796 6.877 9.62Z"></path><path fill="url(#IconifyId1813088fe1fbc01fb467)" d="M185.432.063L96.44 17.501a3.268 3.268 0 0 0-2.634 3.014l-5.474 92.456a3.268 3.268 0 0 0 3.997 3.378l24.777-5.718c2.318-.535 4.413 1.507 3.936 3.838l-7.361 36.047c-.495 2.426 1.782 4.5 4.151 3.78l15.304-4.649c2.372-.72 4.652 1.36 4.15 3.788l-11.698 56.621c-.732 3.542 3.979 5.473 5.943 2.437l1.313-2.028l72.516-144.72c1.215-2.423-.88-5.186-3.54-4.672l-25.505 4.922c-2.396.462-4.435-1.77-3.759-4.114l16.646-57.705c.677-2.35-1.37-4.583-3.769-4.113Z"></path></svg>
+</file>
+
+<file path="frontend/src/assets/react.svg">
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" class="iconify iconify--logos" width="35.93" height="32" preserveAspectRatio="xMidYMid meet" viewBox="0 0 256 228"><path fill="#00D8FF" d="M210.483 73.824a171.49 171.49 0 0 0-8.24-2.597c.465-1.9.893-3.777 1.273-5.621c6.238-30.281 2.16-54.676-11.769-62.708c-13.355-7.7-35.196.329-57.254 19.526a171.23 171.23 0 0 0-6.375 5.848a155.866 155.866 0 0 0-4.241-3.917C100.759 3.829 77.587-4.822 63.673 3.233C50.33 10.957 46.379 33.89 51.995 62.588a170.974 170.974 0 0 0 1.892 8.48c-3.28.932-6.445 1.924-9.474 2.98C17.309 83.498 0 98.307 0 113.668c0 15.865 18.582 31.778 46.812 41.427a145.52 145.52 0 0 0 6.921 2.165a167.467 167.467 0 0 0-2.01 9.138c-5.354 28.2-1.173 50.591 12.134 58.266c13.744 7.926 36.812-.22 59.273-19.855a145.567 145.567 0 0 0 5.342-4.923a168.064 168.064 0 0 0 6.92 6.314c21.758 18.722 43.246 26.282 56.54 18.586c13.731-7.949 18.194-32.003 12.4-61.268a145.016 145.016 0 0 0-1.535-6.842c1.62-.48 3.21-.974 4.76-1.488c29.348-9.723 48.443-25.443 48.443-41.52c0-15.417-17.868-30.326-45.517-39.844Zm-6.365 70.984c-1.4.463-2.836.91-4.3 1.345c-3.24-10.257-7.612-21.163-12.963-32.432c5.106-11 9.31-21.767 12.459-31.957c2.619.758 5.16 1.557 7.61 2.4c23.69 8.156 38.14 20.213 38.14 29.504c0 9.896-15.606 22.743-40.946 31.14Zm-10.514 20.834c2.562 12.94 2.927 24.64 1.23 33.787c-1.524 8.219-4.59 13.698-8.382 15.893c-8.067 4.67-25.32-1.4-43.927-17.412a156.726 156.726 0 0 1-6.437-5.87c7.214-7.889 14.423-17.06 21.459-27.246c12.376-1.098 24.068-2.894 34.671-5.345a134.17 134.17 0 0 1 1.386 6.193ZM87.276 214.515c-7.882 2.783-14.16 2.863-17.955.675c-8.075-4.657-11.432-22.636-6.853-46.752a156.923 156.923 0 0 1 1.869-8.499c10.486 2.32 22.093 3.988 34.498 4.994c7.084 9.967 14.501 19.128 21.976 27.15a134.668 134.668 0 0 1-4.877 4.492c-9.933 8.682-19.886 14.842-28.658 17.94ZM50.35 144.747c-12.483-4.267-22.792-9.812-29.858-15.863c-6.35-5.437-9.555-10.836-9.555-15.216c0-9.322 13.897-21.212 37.076-29.293c2.813-.98 5.757-1.905 8.812-2.773c3.204 10.42 7.406 21.315 12.477 32.332c-5.137 11.18-9.399 22.249-12.634 32.792a134.718 134.718 0 0 1-6.318-1.979Zm12.378-84.26c-4.811-24.587-1.616-43.134 6.425-47.789c8.564-4.958 27.502 2.111 47.463 19.835a144.318 144.318 0 0 1 3.841 3.545c-7.438 7.987-14.787 17.08-21.808 26.988c-12.04 1.116-23.565 2.908-34.161 5.309a160.342 160.342 0 0 1-1.76-7.887Zm110.427 27.268a347.8 347.8 0 0 0-7.785-12.803c8.168 1.033 15.994 2.404 23.343 4.08c-2.206 7.072-4.956 14.465-8.193 22.045a381.151 381.151 0 0 0-7.365-13.322Zm-45.032-43.861c5.044 5.465 10.096 11.566 15.065 18.186a322.04 322.04 0 0 0-30.257-.006c4.974-6.559 10.069-12.652 15.192-18.18ZM82.802 87.83a323.167 323.167 0 0 0-7.227 13.238c-3.184-7.553-5.909-14.98-8.134-22.152c7.304-1.634 15.093-2.97 23.209-3.984a321.524 321.524 0 0 0-7.848 12.897Zm8.081 65.352c-8.385-.936-16.291-2.203-23.593-3.793c2.26-7.3 5.045-14.885 8.298-22.6a321.187 321.187 0 0 0 7.257 13.246c2.594 4.48 5.28 8.868 8.038 13.147Zm37.542 31.03c-5.184-5.592-10.354-11.779-15.403-18.433c4.902.192 9.899.29 14.978.29c5.218 0 10.376-.117 15.453-.343c-4.985 6.774-10.018 12.97-15.028 18.486Zm52.198-57.817c3.422 7.8 6.306 15.345 8.596 22.52c-7.422 1.694-15.436 3.058-23.88 4.071a382.417 382.417 0 0 0 7.859-13.026a347.403 347.403 0 0 0 7.425-13.565Zm-16.898 8.101a358.557 358.557 0 0 1-12.281 19.815a329.4 329.4 0 0 1-23.444.823c-7.967 0-15.716-.248-23.178-.732a310.202 310.202 0 0 1-12.513-19.846h.001a307.41 307.41 0 0 1-10.923-20.627a310.278 310.278 0 0 1 10.89-20.637l-.001.001a307.318 307.318 0 0 1 12.413-19.761c7.613-.576 15.42-.876 23.31-.876H128c7.926 0 15.743.303 23.354.883a329.357 329.357 0 0 1 12.335 19.695a358.489 358.489 0 0 1 11.036 20.54a329.472 329.472 0 0 1-11 20.722Zm22.56-122.124c8.572 4.944 11.906 24.881 6.52 51.026c-.344 1.668-.73 3.367-1.15 5.09c-10.622-2.452-22.155-4.275-34.23-5.408c-7.034-10.017-14.323-19.124-21.64-27.008a160.789 160.789 0 0 1 5.888-5.4c18.9-16.447 36.564-22.941 44.612-18.3ZM128 90.808c12.625 0 22.86 10.235 22.86 22.86s-10.235 22.86-22.86 22.86s-22.86-10.235-22.86-22.86s10.235-22.86 22.86-22.86Z"></path></svg>
+</file>
+
+<file path="frontend/src/App.css">
+#root {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 2rem;
+  text-align: center;
+}
+
+.logo {
+  height: 6em;
+  padding: 1.5em;
+  will-change: filter;
+  transition: filter 300ms;
+}
+.logo:hover {
+  filter: drop-shadow(0 0 2em #646cffaa);
+}
+.logo.react:hover {
+  filter: drop-shadow(0 0 2em #61dafbaa);
+}
+
+@keyframes logo-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  a:nth-of-type(2) .logo {
+    animation: logo-spin infinite 20s linear;
+  }
+}
+
+.card {
+  padding: 2em;
+}
+
+.read-the-docs {
+  color: #888;
+}
+</file>
+
+<file path="frontend/src/App.jsx">
+import React from "react";
+import SpeechStudio from "./SpeechStudio";
+
+function App() {
+  return (
+    <div className="min-h-screen bg-gray-100">
+      <SpeechStudio />
+    </div>
+  );
+}
+
+export default App;
+</file>
+
+<file path="frontend/src/index.css">
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+</file>
+
+<file path="frontend/src/main.jsx">
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.jsx'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+</file>
+
+<file path="frontend/src/SpeechStudio.jsx">
+import React, { useState, useRef, useEffect } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import { Mic, Send } from "lucide-react";
+import * as THREE from "three";
+
+// Particle effect
+function VoiceParticles({ audioData, chatBoxRef }) {
+  const pointsRef = useRef();
+  const particleCount = 600;
+  const positions = useRef(new Float32Array(particleCount * 3));
+  const colors = useRef(new Float32Array(particleCount * 3));
+  const velocities = useRef(new Float32Array(particleCount));
+
+  // Initialize particles
+  useEffect(() => {
+    const chatBox = chatBoxRef.current;
+    const rect = chatBox?.getBoundingClientRect() || { bottom: 0 };
+    const startY = (rect.bottom / window.innerHeight) * 5 - 2.5;
+
+    for (let i = 0; i < particleCount; i++) {
+      positions.current[i * 3] = (Math.random() - 0.5) * 6;
+      positions.current[i * 3 + 1] = startY;
+      positions.current[i * 3 + 2] = (Math.random() - 0.5) * 1;
+      velocities.current[i] = 0.02 + Math.random() * 0.02;
+
+      const color = new THREE.Color();
+      color.setHSL(Math.random(), 1, 0.5);
+      colors.current[i * 3] = color.r;
+      colors.current[i * 3 + 1] = color.g;
+      colors.current[i * 3 + 2] = color.b;
+    }
+  }, [chatBoxRef]);
+
+  useFrame(() => {
+    if (!pointsRef.current) return;
+    const amp = (audioData.current || 0) / 80;
+
+    for (let i = 0; i < particleCount; i++) {
+      const ix = i * 3;
+      positions.current[ix + 1] += velocities.current[i] * (1 + amp * 4);
+      positions.current[ix + 0] += Math.sin(Date.now() * 0.001 + ix) * 0.002;
+      positions.current[ix + 2] += Math.cos(Date.now() * 0.001 + ix) * 0.002;
+
+      if (positions.current[ix + 1] > 5) {
+        const chatBox = chatBoxRef.current;
+        const rect = chatBox?.getBoundingClientRect() || { bottom: 0 };
+        positions.current[ix + 1] = (rect.bottom / window.innerHeight) * 5 - 2.5;
+        positions.current[ix + 0] = (Math.random() - 0.5) * 6;
+        positions.current[ix + 2] = (Math.random() - 0.5) * 1;
+      }
+    }
+
+    pointsRef.current.geometry.attributes.position.needsUpdate = true;
+  });
+
+  return (
+    <points ref={pointsRef}>
+      <bufferGeometry>
+        <bufferAttribute
+          attach="attributes-position"
+          count={particleCount}
+          array={positions.current}
+          itemSize={3}
+        />
+        <bufferAttribute
+          attach="attributes-color"
+          count={particleCount}
+          array={colors.current}
+          itemSize={3}
+        />
+      </bufferGeometry>
+      <pointsMaterial vertexColors size={0.15} transparent opacity={0.9} />
+    </points>
+  );
+}
+
+export default function SpeechStudio() {
+  const [text, setText] = useState("");
+  const [messages, setMessages] = useState([]);
+  const [lang, setLang] = useState("en-US");
+  const audioData = useRef(0);
+  const chatBoxRef = useRef();
+
+  // Microphone & audio analyser
+  useEffect(() => {
+    async function initMic() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+        const updateAudio = () => {
+          analyser.getByteFrequencyData(dataArray);
+          audioData.current = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+          requestAnimationFrame(updateAudio);
+        };
+        updateAudio();
+      } catch {
+        alert("Allow microphone access for live particle effects.");
+      }
+    }
+    initMic();
+  }, []);
+
+  const speakText = (message) => {
+    const ttsLang = lang === "bho-IN" ? "hi-IN" : lang;
+    const utter = new SpeechSynthesisUtterance(message);
+    utter.lang = ttsLang;
+    const voices = window.speechSynthesis.getVoices();
+    const voice = voices.find((v) => v.lang === ttsLang);
+    if (voice) utter.voice = voice;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utter);
+  };
+
+  // ✅ Backend call
+  const sendToBackend = async (query) => {
+    try {
+      const res = await fetch("http://127.0.0.1:8000/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode:1,query: query }),
+      });
+      const data = await res.json();
+      print(data)
+      const reply = typeof data.reply === "string" ? data.reply : JSON.stringify(data.reply);
+      setMessages((prev) => [...prev, { role: "bot", content: reply }]);
+      speakText(reply);
+    } catch (err) {
+      console.error("Error:", err);
+      setMessages((prev) => [...prev, { role: "bot", content: "❌ Backend error" }]);
+    }
+  };
+
+  const handleSend = () => {
+    if (!text.trim()) return;
+    const userMessage = text;
+    setMessages((prev) => [...prev, { role: "user", content: userMessage }]);
+    setText("");
+    sendToBackend(userMessage);
+  };
+
+  const startRecognition = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return alert("Speech recognition not supported.");
+    const recog = new SpeechRecognition();
+    recog.continuous = false;
+    recog.interimResults = false;
+    recog.lang = lang;
+    recog.onresult = (e) => {
+      const transcript = e.results[0][0].transcript;
+      setMessages((prev) => [...prev, { role: "user", content: transcript }]);
+      sendToBackend(transcript);
+    };
+    recog.start();
+  };
+
+  return (
+    <div className="min-h-screen relative bg-gray-900 flex flex-col items-center justify-center p-6 overflow-hidden">
+      {/* Chat UI */}
+      <div
+        ref={chatBoxRef}
+        className="w-full max-w-2xl bg-white rounded-3xl shadow-xl flex flex-col overflow-hidden border border-gray-200 mb-6 z-10 relative"
+      >
+        <div className="flex-1 p-4 overflow-y-auto max-h-96 space-y-3">
+          {messages.length === 0 && <p className="text-gray-400 text-center">No messages yet...</p>}
+          {messages.map((m, i) => (
+            <div
+              key={i}
+              className={`px-4 py-2 rounded-lg max-w-xs break-words ${
+                m.role === "user"
+                  ? "bg-indigo-600 text-white self-end ml-auto"
+                  : "bg-gray-200 text-gray-900 self-start"
+              }`}
+            >
+              {m.content}
+            </div>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-2 p-3 border-t bg-gray-50">
+          <select
+            value={lang}
+            onChange={(e) => setLang(e.target.value)}
+            className="px-3 py-1 rounded-xl border text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+          >
+            <option value="en-US">English (US)</option>
+            <option value="hi-IN">Hindi</option>
+            <option value="bho-IN">Bhojpuri</option>
+          </select>
+
+          <input
+            type="text"
+            placeholder="Type a message..."
+            className="flex-1 px-4 py-2 rounded-2xl bg-gray-100 border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-400"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleSend()}
+          />
+
+          <button
+            onClick={handleSend}
+            className="p-3 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white transition-transform transform hover:scale-105"
+          >
+            <Send size={20} />
+          </button>
+
+          <button
+            onClick={startRecognition}
+            className="p-3 rounded-full bg-green-600 hover:bg-green-500 text-white transition-transform transform hover:scale-105"
+          >
+            <Mic size={20} />
+          </button>
+        </div>
+      </div>
+
+      {/* Particle Canvas */}
+      <Canvas
+        className="absolute top-0 left-0 w-full h-full -z-0 pointer-events-none"
+        camera={{ position: [0, 0, 10], fov: 50 }}
+      >
+        <VoiceParticles audioData={audioData} chatBoxRef={chatBoxRef} />
+      </Canvas>
+    </div>
+  );
+}
+</file>
+
+<file path="frontend/.gitignore">
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+node_modules
+*.env
+*.xml
+*.config.js
+</file>
+
+<file path="frontend/index.html">
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>speech-app</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+</file>
+
+<file path="frontend/package.json">
+{
+  "name": "speech-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint .",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@react-three/drei": "^10.7.6",
+    "@react-three/fiber": "^9.3.0",
+    "framer-motion": "^12.23.22",
+    "lucide-react": "^0.544.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "three": "^0.180.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.36.0",
+    "@types/react": "^19.1.13",
+    "@types/react-dom": "^19.1.9",
+    "@vitejs/plugin-react": "^5.0.3",
+    "autoprefixer": "^10.4.21",
+    "eslint": "^9.36.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "eslint-plugin-react-refresh": "^0.4.20",
+    "globals": "^16.4.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.17",
+    "vite": "^7.1.7"
+  }
+}
+</file>
+
+<file path="frontend/postcss.config.cjs">
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+</file>
+
+<file path="frontend/README.md">
+# React + Vite
+
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+
+Currently, two official plugins are available:
+
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) for Fast Refresh
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+
+## React Compiler
+
+The React Compiler is not enabled on this template. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+
+## Expanding the ESLint configuration
+
+If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+</file>
+
+<file path="compressor.py">
+from llmlingua import PromptCompressor
+import torch
+class Compressor():
+    def __init__(self):
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.llm_lingua = PromptCompressor(
+            "microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank",
+            use_llmlingua2=True, 
+            device_map=self.device
+            )
+
+    def compress_prompt(self,text):
+        print("------------------------------------------------------------------------------------------------")
+        print(f"Using Device: {self.device}")
+        token_count = len(text.split())
+        rate = 1.0 if token_count <= 20 else 0.7 if token_count <= 35 else 0.6 if token_count <= 50 else 0.5
+        print(f"Tokens: {token_count}, Rate: {rate}")
+        result = self.llm_lingua.compress_prompt(text, rate=rate)
+        print(f"Stats: {result['origin_tokens']} --> {result['compressed_tokens']} tokens ({result['ratio']})")
+        print("------------------------------------------------------------------------------------------------")
+        return result['compressed_prompt']
+</file>
+
+<file path="helper.py">
+import asyncio
+import aiofiles
+import json
+from playwright.async_api import async_playwright
+import time
+import random
+import re
+
+class AsyncHelper:
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+
+    async def setup(self):
+        """Async setup for browser"""
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(
+            headless=False,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=VizDisplayCompositor',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding'
+            ]
+        )
+        
+        user_agents = [
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ]
+        
+        self.context = await self.browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            user_agent=random.choice(user_agents),
+            extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            }
+        )
+        self.page = await self.context.new_page()
+        await self.page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            })
+        """)
+
+    async def save_results(self):
+        try:
+            async with aiofiles.open("results_log.txt", "a") as f:
+                await f.write(f"URL: {self.page.url}\n")
+                await f.write(f"Title: {await self.page.title()}\n")
+                content = await self.extract_visible_content()
+                await f.write(f"Content Preview: {content[:500]}\n")
+                await f.write("="*50 + "\n")
+            return "Results saved to results_log.txt"
+        except Exception as e:
+            return f"Error saving results: {e}"
+
+    async def human_like_delay(self, min_sec=1, max_sec=4):
+        base_delay = random.uniform(min_sec, max_sec)
+        await asyncio.sleep(base_delay)
+
+    async def human_like_mouse_movement(self):
+        try:
+            for _ in range(3):
+                x = random.randint(100, 1200)
+                y = random.randint(100, 600)
+                await self.page.mouse.move(x, y)
+                await asyncio.sleep(0.2)
+        except:
+            pass
+
+    async def search_google_safely(self, query: str):
+        try:
+            print(f"🔍 Searching for: {query}")
+            await self.page.goto("https://www.wikipedia.org", wait_until="networkidle")
+            await self.human_like_delay(1, 2)
+            await self.page.goto("https://www.google.com", wait_until="networkidle")
+            await self.human_like_delay(1, 3)
+            
+            search_box = "textarea[name='q'], input[name='q']"
+            await self.page.wait_for_selector(search_box, timeout=10000)
+            await self.page.click(search_box)
+            await self.human_like_delay(0.5, 1)
+            
+            for i, char in enumerate(query):
+                await self.page.type(search_box, char, delay=random.randint(80, 200))
+                if random.random() > 0.9:
+                    await self.human_like_delay(0.1, 0.4)
+                if i % 5 == 0:
+                    await self.human_like_mouse_movement()
+                    
+            await self.human_like_delay(1, 2)
+            await self.page.press(search_box, "Enter")
+            await self.human_like_delay(1, 4)
+            
+            content = await self.page.content()
+            content_lower = content.lower()
+            if any(blocked in content_lower for blocked in ["unusual traffic", "detected unusual traffic", "captcha"]):
+                print("🚫 Blocked by Google. Trying alternative approach...")
+                return await self.use_alternative_search_engine(query)
+            
+            return await self.get_page_info()
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def use_alternative_search_engine(self, query: str):
+        alternatives = [
+            ("https://search.yahoo.com", "input[name='p']"),
+            ("https://duckduckgo.com", "input[name='q']"),
+            ("https://www.bing.com", "input[name='q']"),
+        ]
+        for url, selector in alternatives:
+            try:
+                await self.page.goto(url, wait_until="networkidle")
+                await self.page.fill(selector, query)
+                await self.page.press(selector, "Enter")
+                await self.human_like_delay(2, 4)
+                return await self.get_page_info()
+            except:
+                continue
+        return {"error": "All search engines blocked"}
+
+    async def smart_click(self, target: str):
+        strategies = [
+            f"a:has-text('{target}')",
+            f"h3:has-text('{target}')",
+            f"div:has-text('{target}')",
+            f"span:has-text('{target}')",
+            f"button:has-text('{target}')",
+        ]
+        
+        for selector in strategies:
+            try:
+                if await self.page.locator(selector).count() > 0:
+                    await self.human_like_mouse_movement()
+                    await self.page.click(selector)
+                    await self.human_like_delay(1, 2)
+                    return await self.get_page_info()
+            except:
+                continue
+        return "Click failed - element not found"
+
+    async def extract_visible_content(self):
+        try:
+            data = await self.page.evaluate("""
+                () => {
+                    const tags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a'];
+                    const result = [];
+
+                    tags.forEach(tagName => {
+                        const nodes = document.querySelectorAll(tagName);
+                        nodes.forEach(node => {
+                            const text = node.innerText?.trim() || '';
+                            const id = node.id || null;
+                            const className = node.className || null;
+                            let href = null;
+                            if (tagName === 'a') {
+                                href = node.getAttribute('href');
+                            }
+                            result.push({
+                                tag: tagName,
+                                text: text,
+                                id: id,
+                                class: className,
+                                href: href
+                            });
+                        });
+                    });
+
+                    return result;
+                }
+            """)
+            return data
+        except Exception as e:
+            return f"Extraction error: {e}"
+
+    async def get_page_info(self):
+        try:
+            content = await self.extract_visible_content()
+            return {
+                "url": self.page.url,
+                "title": await self.page.title(),
+                "content_preview": content[:500] if content else ""
+            }
+        except:
+            return {"error": "Could not get page info"}
+
+    async def close(self):
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+
+    async def clear_cookies_and_cache(self):
+        """Clear cookies and cache between sessions"""
+        try:
+            await self.context.clear_cookies()
+            await self.page.evaluate("() => localStorage.clear()")
+            await self.page.evaluate("() => sessionStorage.clear()")
+        except:
+            pass
+
+    async def rotate_user_agent(self):
+        """Rotate user agent for new sessions"""
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
+        ]
+        new_agent = random.choice(user_agents)
+        await self.context.set_extra_http_headers({'User-Agent': new_agent})
+</file>
+
+<file path="LICENSE">
+GNU GENERAL PUBLIC LICENSE
+                       Version 3, 29 June 2007
+
+ Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+ Everyone is permitted to copy and distribute verbatim copies
+ of this license document, but changing it is not allowed.
+
+                            Preamble
+
+  The GNU General Public License is a free, copyleft license for
+software and other kinds of works.
+
+  The licenses for most software and other practical works are designed
+to take away your freedom to share and change the works.  By contrast,
+the GNU General Public License is intended to guarantee your freedom to
+share and change all versions of a program--to make sure it remains free
+software for all its users.  We, the Free Software Foundation, use the
+GNU General Public License for most of our software; it applies also to
+any other work released this way by its authors.  You can apply it to
+your programs, too.
+
+  When we speak of free software, we are referring to freedom, not
+price.  Our General Public Licenses are designed to make sure that you
+have the freedom to distribute copies of free software (and charge for
+them if you wish), that you receive source code or can get it if you
+want it, that you can change the software or use pieces of it in new
+free programs, and that you know you can do these things.
+
+  To protect your rights, we need to prevent others from denying you
+these rights or asking you to surrender the rights.  Therefore, you have
+certain responsibilities if you distribute copies of the software, or if
+you modify it: responsibilities to respect the freedom of others.
+
+  For example, if you distribute copies of such a program, whether
+gratis or for a fee, you must pass on to the recipients the same
+freedoms that you received.  You must make sure that they, too, receive
+or can get the source code.  And you must show them these terms so they
+know their rights.
+
+  Developers that use the GNU GPL protect your rights with two steps:
+(1) assert copyright on the software, and (2) offer you this License
+giving you legal permission to copy, distribute and/or modify it.
+
+  For the developers' and authors' protection, the GPL clearly explains
+that there is no warranty for this free software.  For both users' and
+authors' sake, the GPL requires that modified versions be marked as
+changed, so that their problems will not be attributed erroneously to
+authors of previous versions.
+
+  Some devices are designed to deny users access to install or run
+modified versions of the software inside them, although the manufacturer
+can do so.  This is fundamentally incompatible with the aim of
+protecting users' freedom to change the software.  The systematic
+pattern of such abuse occurs in the area of products for individuals to
+use, which is precisely where it is most unacceptable.  Therefore, we
+have designed this version of the GPL to prohibit the practice for those
+products.  If such problems arise substantially in other domains, we
+stand ready to extend this provision to those domains in future versions
+of the GPL, as needed to protect the freedom of users.
+
+  Finally, every program is threatened constantly by software patents.
+States should not allow patents to restrict development and use of
+software on general-purpose computers, but in those that do, we wish to
+avoid the special danger that patents applied to a free program could
+make it effectively proprietary.  To prevent this, the GPL assures that
+patents cannot be used to render the program non-free.
+
+  The precise terms and conditions for copying, distribution and
+modification follow.
+
+                       TERMS AND CONDITIONS
+
+  0. Definitions.
+
+  "This License" refers to version 3 of the GNU General Public License.
+
+  "Copyright" also means copyright-like laws that apply to other kinds of
+works, such as semiconductor masks.
+
+  "The Program" refers to any copyrightable work licensed under this
+License.  Each licensee is addressed as "you".  "Licensees" and
+"recipients" may be individuals or organizations.
+
+  To "modify" a work means to copy from or adapt all or part of the work
+in a fashion requiring copyright permission, other than the making of an
+exact copy.  The resulting work is called a "modified version" of the
+earlier work or a work "based on" the earlier work.
+
+  A "covered work" means either the unmodified Program or a work based
+on the Program.
+
+  To "propagate" a work means to do anything with it that, without
+permission, would make you directly or secondarily liable for
+infringement under applicable copyright law, except executing it on a
+computer or modifying a private copy.  Propagation includes copying,
+distribution (with or without modification), making available to the
+public, and in some countries other activities as well.
+
+  To "convey" a work means any kind of propagation that enables other
+parties to make or receive copies.  Mere interaction with a user through
+a computer network, with no transfer of a copy, is not conveying.
+
+  An interactive user interface displays "Appropriate Legal Notices"
+to the extent that it includes a convenient and prominently visible
+feature that (1) displays an appropriate copyright notice, and (2)
+tells the user that there is no warranty for the work (except to the
+extent that warranties are provided), that licensees may convey the
+work under this License, and how to view a copy of this License.  If
+the interface presents a list of user commands or options, such as a
+menu, a prominent item in the list meets this criterion.
+
+  1. Source Code.
+
+  The "source code" for a work means the preferred form of the work
+for making modifications to it.  "Object code" means any non-source
+form of a work.
+
+  A "Standard Interface" means an interface that either is an official
+standard defined by a recognized standards body, or, in the case of
+interfaces specified for a particular programming language, one that
+is widely used among developers working in that language.
+
+  The "System Libraries" of an executable work include anything, other
+than the work as a whole, that (a) is included in the normal form of
+packaging a Major Component, but which is not part of that Major
+Component, and (b) serves only to enable use of the work with that
+Major Component, or to implement a Standard Interface for which an
+implementation is available to the public in source code form.  A
+"Major Component", in this context, means a major essential component
+(kernel, window system, and so on) of the specific operating system
+(if any) on which the executable work runs, or a compiler used to
+produce the work, or an object code interpreter used to run it.
+
+  The "Corresponding Source" for a work in object code form means all
+the source code needed to generate, install, and (for an executable
+work) run the object code and to modify the work, including scripts to
+control those activities.  However, it does not include the work's
+System Libraries, or general-purpose tools or generally available free
+programs which are used unmodified in performing those activities but
+which are not part of the work.  For example, Corresponding Source
+includes interface definition files associated with source files for
+the work, and the source code for shared libraries and dynamically
+linked subprograms that the work is specifically designed to require,
+such as by intimate data communication or control flow between those
+subprograms and other parts of the work.
+
+  The Corresponding Source need not include anything that users
+can regenerate automatically from other parts of the Corresponding
+Source.
+
+  The Corresponding Source for a work in source code form is that
+same work.
+
+  2. Basic Permissions.
+
+  All rights granted under this License are granted for the term of
+copyright on the Program, and are irrevocable provided the stated
+conditions are met.  This License explicitly affirms your unlimited
+permission to run the unmodified Program.  The output from running a
+covered work is covered by this License only if the output, given its
+content, constitutes a covered work.  This License acknowledges your
+rights of fair use or other equivalent, as provided by copyright law.
+
+  You may make, run and propagate covered works that you do not
+convey, without conditions so long as your license otherwise remains
+in force.  You may convey covered works to others for the sole purpose
+of having them make modifications exclusively for you, or provide you
+with facilities for running those works, provided that you comply with
+the terms of this License in conveying all material for which you do
+not control copyright.  Those thus making or running the covered works
+for you must do so exclusively on your behalf, under your direction
+and control, on terms that prohibit them from making any copies of
+your copyrighted material outside their relationship with you.
+
+  Conveying under any other circumstances is permitted solely under
+the conditions stated below.  Sublicensing is not allowed; section 10
+makes it unnecessary.
+
+  3. Protecting Users' Legal Rights From Anti-Circumvention Law.
+
+  No covered work shall be deemed part of an effective technological
+measure under any applicable law fulfilling obligations under article
+11 of the WIPO copyright treaty adopted on 20 December 1996, or
+similar laws prohibiting or restricting circumvention of such
+measures.
+
+  When you convey a covered work, you waive any legal power to forbid
+circumvention of technological measures to the extent such circumvention
+is effected by exercising rights under this License with respect to
+the covered work, and you disclaim any intention to limit operation or
+modification of the work as a means of enforcing, against the work's
+users, your or third parties' legal rights to forbid circumvention of
+technological measures.
+
+  4. Conveying Verbatim Copies.
+
+  You may convey verbatim copies of the Program's source code as you
+receive it, in any medium, provided that you conspicuously and
+appropriately publish on each copy an appropriate copyright notice;
+keep intact all notices stating that this License and any
+non-permissive terms added in accord with section 7 apply to the code;
+keep intact all notices of the absence of any warranty; and give all
+recipients a copy of this License along with the Program.
+
+  You may charge any price or no price for each copy that you convey,
+and you may offer support or warranty protection for a fee.
+
+  5. Conveying Modified Source Versions.
+
+  You may convey a work based on the Program, or the modifications to
+produce it from the Program, in the form of source code under the
+terms of section 4, provided that you also meet all of these conditions:
+
+    a) The work must carry prominent notices stating that you modified
+    it, and giving a relevant date.
+
+    b) The work must carry prominent notices stating that it is
+    released under this License and any conditions added under section
+    7.  This requirement modifies the requirement in section 4 to
+    "keep intact all notices".
+
+    c) You must license the entire work, as a whole, under this
+    License to anyone who comes into possession of a copy.  This
+    License will therefore apply, along with any applicable section 7
+    additional terms, to the whole of the work, and all its parts,
+    regardless of how they are packaged.  This License gives no
+    permission to license the work in any other way, but it does not
+    invalidate such permission if you have separately received it.
+
+    d) If the work has interactive user interfaces, each must display
+    Appropriate Legal Notices; however, if the Program has interactive
+    interfaces that do not display Appropriate Legal Notices, your
+    work need not make them do so.
+
+  A compilation of a covered work with other separate and independent
+works, which are not by their nature extensions of the covered work,
+and which are not combined with it such as to form a larger program,
+in or on a volume of a storage or distribution medium, is called an
+"aggregate" if the compilation and its resulting copyright are not
+used to limit the access or legal rights of the compilation's users
+beyond what the individual works permit.  Inclusion of a covered work
+in an aggregate does not cause this License to apply to the other
+parts of the aggregate.
+
+  6. Conveying Non-Source Forms.
+
+  You may convey a covered work in object code form under the terms
+of sections 4 and 5, provided that you also convey the
+machine-readable Corresponding Source under the terms of this License,
+in one of these ways:
+
+    a) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by the
+    Corresponding Source fixed on a durable physical medium
+    customarily used for software interchange.
+
+    b) Convey the object code in, or embodied in, a physical product
+    (including a physical distribution medium), accompanied by a
+    written offer, valid for at least three years and valid for as
+    long as you offer spare parts or customer support for that product
+    model, to give anyone who possesses the object code either (1) a
+    copy of the Corresponding Source for all the software in the
+    product that is covered by this License, on a durable physical
+    medium customarily used for software interchange, for a price no
+    more than your reasonable cost of physically performing this
+    conveying of source, or (2) access to copy the
+    Corresponding Source from a network server at no charge.
+
+    c) Convey individual copies of the object code with a copy of the
+    written offer to provide the Corresponding Source.  This
+    alternative is allowed only occasionally and noncommercially, and
+    only if you received the object code with such an offer, in accord
+    with subsection 6b.
+
+    d) Convey the object code by offering access from a designated
+    place (gratis or for a charge), and offer equivalent access to the
+    Corresponding Source in the same way through the same place at no
+    further charge.  You need not require recipients to copy the
+    Corresponding Source along with the object code.  If the place to
+    copy the object code is a network server, the Corresponding Source
+    may be on a different server (operated by you or a third party)
+    that supports equivalent copying facilities, provided you maintain
+    clear directions next to the object code saying where to find the
+    Corresponding Source.  Regardless of what server hosts the
+    Corresponding Source, you remain obligated to ensure that it is
+    available for as long as needed to satisfy these requirements.
+
+    e) Convey the object code using peer-to-peer transmission, provided
+    you inform other peers where the object code and Corresponding
+    Source of the work are being offered to the general public at no
+    charge under subsection 6d.
+
+  A separable portion of the object code, whose source code is excluded
+from the Corresponding Source as a System Library, need not be
+included in conveying the object code work.
+
+  A "User Product" is either (1) a "consumer product", which means any
+tangible personal property which is normally used for personal, family,
+or household purposes, or (2) anything designed or sold for incorporation
+into a dwelling.  In determining whether a product is a consumer product,
+doubtful cases shall be resolved in favor of coverage.  For a particular
+product received by a particular user, "normally used" refers to a
+typical or common use of that class of product, regardless of the status
+of the particular user or of the way in which the particular user
+actually uses, or expects or is expected to use, the product.  A product
+is a consumer product regardless of whether the product has substantial
+commercial, industrial or non-consumer uses, unless such uses represent
+the only significant mode of use of the product.
+
+  "Installation Information" for a User Product means any methods,
+procedures, authorization keys, or other information required to install
+and execute modified versions of a covered work in that User Product from
+a modified version of its Corresponding Source.  The information must
+suffice to ensure that the continued functioning of the modified object
+code is in no case prevented or interfered with solely because
+modification has been made.
+
+  If you convey an object code work under this section in, or with, or
+specifically for use in, a User Product, and the conveying occurs as
+part of a transaction in which the right of possession and use of the
+User Product is transferred to the recipient in perpetuity or for a
+fixed term (regardless of how the transaction is characterized), the
+Corresponding Source conveyed under this section must be accompanied
+by the Installation Information.  But this requirement does not apply
+if neither you nor any third party retains the ability to install
+modified object code on the User Product (for example, the work has
+been installed in ROM).
+
+  The requirement to provide Installation Information does not include a
+requirement to continue to provide support service, warranty, or updates
+for a work that has been modified or installed by the recipient, or for
+the User Product in which it has been modified or installed.  Access to a
+network may be denied when the modification itself materially and
+adversely affects the operation of the network or violates the rules and
+protocols for communication across the network.
+
+  Corresponding Source conveyed, and Installation Information provided,
+in accord with this section must be in a format that is publicly
+documented (and with an implementation available to the public in
+source code form), and must require no special password or key for
+unpacking, reading or copying.
+
+  7. Additional Terms.
+
+  "Additional permissions" are terms that supplement the terms of this
+License by making exceptions from one or more of its conditions.
+Additional permissions that are applicable to the entire Program shall
+be treated as though they were included in this License, to the extent
+that they are valid under applicable law.  If additional permissions
+apply only to part of the Program, that part may be used separately
+under those permissions, but the entire Program remains governed by
+this License without regard to the additional permissions.
+
+  When you convey a copy of a covered work, you may at your option
+remove any additional permissions from that copy, or from any part of
+it.  (Additional permissions may be written to require their own
+removal in certain cases when you modify the work.)  You may place
+additional permissions on material, added by you to a covered work,
+for which you have or can give appropriate copyright permission.
+
+  Notwithstanding any other provision of this License, for material you
+add to a covered work, you may (if authorized by the copyright holders of
+that material) supplement the terms of this License with terms:
+
+    a) Disclaiming warranty or limiting liability differently from the
+    terms of sections 15 and 16 of this License; or
+
+    b) Requiring preservation of specified reasonable legal notices or
+    author attributions in that material or in the Appropriate Legal
+    Notices displayed by works containing it; or
+
+    c) Prohibiting misrepresentation of the origin of that material, or
+    requiring that modified versions of such material be marked in
+    reasonable ways as different from the original version; or
+
+    d) Limiting the use for publicity purposes of names of licensors or
+    authors of the material; or
+
+    e) Declining to grant rights under trademark law for use of some
+    trade names, trademarks, or service marks; or
+
+    f) Requiring indemnification of licensors and authors of that
+    material by anyone who conveys the material (or modified versions of
+    it) with contractual assumptions of liability to the recipient, for
+    any liability that these contractual assumptions directly impose on
+    those licensors and authors.
+
+  All other non-permissive additional terms are considered "further
+restrictions" within the meaning of section 10.  If the Program as you
+received it, or any part of it, contains a notice stating that it is
+governed by this License along with a term that is a further
+restriction, you may remove that term.  If a license document contains
+a further restriction but permits relicensing or conveying under this
+License, you may add to a covered work material governed by the terms
+of that license document, provided that the further restriction does
+not survive such relicensing or conveying.
+
+  If you add terms to a covered work in accord with this section, you
+must place, in the relevant source files, a statement of the
+additional terms that apply to those files, or a notice indicating
+where to find the applicable terms.
+
+  Additional terms, permissive or non-permissive, may be stated in the
+form of a separately written license, or stated as exceptions;
+the above requirements apply either way.
+
+  8. Termination.
+
+  You may not propagate or modify a covered work except as expressly
+provided under this License.  Any attempt otherwise to propagate or
+modify it is void, and will automatically terminate your rights under
+this License (including any patent licenses granted under the third
+paragraph of section 11).
+
+  However, if you cease all violation of this License, then your
+license from a particular copyright holder is reinstated (a)
+provisionally, unless and until the copyright holder explicitly and
+finally terminates your license, and (b) permanently, if the copyright
+holder fails to notify you of the violation by some reasonable means
+prior to 60 days after the cessation.
+
+  Moreover, your license from a particular copyright holder is
+reinstated permanently if the copyright holder notifies you of the
+violation by some reasonable means, this is the first time you have
+received notice of violation of this License (for any work) from that
+copyright holder, and you cure the violation prior to 30 days after
+your receipt of the notice.
+
+  Termination of your rights under this section does not terminate the
+licenses of parties who have received copies or rights from you under
+this License.  If your rights have been terminated and not permanently
+reinstated, you do not qualify to receive new licenses for the same
+material under section 10.
+
+  9. Acceptance Not Required for Having Copies.
+
+  You are not required to accept this License in order to receive or
+run a copy of the Program.  Ancillary propagation of a covered work
+occurring solely as a consequence of using peer-to-peer transmission
+to receive a copy likewise does not require acceptance.  However,
+nothing other than this License grants you permission to propagate or
+modify any covered work.  These actions infringe copyright if you do
+not accept this License.  Therefore, by modifying or propagating a
+covered work, you indicate your acceptance of this License to do so.
+
+  10. Automatic Licensing of Downstream Recipients.
+
+  Each time you convey a covered work, the recipient automatically
+receives a license from the original licensors, to run, modify and
+propagate that work, subject to this License.  You are not responsible
+for enforcing compliance by third parties with this License.
+
+  An "entity transaction" is a transaction transferring control of an
+organization, or substantially all assets of one, or subdividing an
+organization, or merging organizations.  If propagation of a covered
+work results from an entity transaction, each party to that
+transaction who receives a copy of the work also receives whatever
+licenses to the work the party's predecessor in interest had or could
+give under the previous paragraph, plus a right to possession of the
+Corresponding Source of the work from the predecessor in interest, if
+the predecessor has it or can get it with reasonable efforts.
+
+  You may not impose any further restrictions on the exercise of the
+rights granted or affirmed under this License.  For example, you may
+not impose a license fee, royalty, or other charge for exercise of
+rights granted under this License, and you may not initiate litigation
+(including a cross-claim or counterclaim in a lawsuit) alleging that
+any patent claim is infringed by making, using, selling, offering for
+sale, or importing the Program or any portion of it.
+
+  11. Patents.
+
+  A "contributor" is a copyright holder who authorizes use under this
+License of the Program or a work on which the Program is based.  The
+work thus licensed is called the contributor's "contributor version".
+
+  A contributor's "essential patent claims" are all patent claims
+owned or controlled by the contributor, whether already acquired or
+hereafter acquired, that would be infringed by some manner, permitted
+by this License, of making, using, or selling its contributor version,
+but do not include claims that would be infringed only as a
+consequence of further modification of the contributor version.  For
+purposes of this definition, "control" includes the right to grant
+patent sublicenses in a manner consistent with the requirements of
+this License.
+
+  Each contributor grants you a non-exclusive, worldwide, royalty-free
+patent license under the contributor's essential patent claims, to
+make, use, sell, offer for sale, import and otherwise run, modify and
+propagate the contents of its contributor version.
+
+  In the following three paragraphs, a "patent license" is any express
+agreement or commitment, however denominated, not to enforce a patent
+(such as an express permission to practice a patent or covenant not to
+sue for patent infringement).  To "grant" such a patent license to a
+party means to make such an agreement or commitment not to enforce a
+patent against the party.
+
+  If you convey a covered work, knowingly relying on a patent license,
+and the Corresponding Source of the work is not available for anyone
+to copy, free of charge and under the terms of this License, through a
+publicly available network server or other readily accessible means,
+then you must either (1) cause the Corresponding Source to be so
+available, or (2) arrange to deprive yourself of the benefit of the
+patent license for this particular work, or (3) arrange, in a manner
+consistent with the requirements of this License, to extend the patent
+license to downstream recipients.  "Knowingly relying" means you have
+actual knowledge that, but for the patent license, your conveying the
+covered work in a country, or your recipient's use of the covered work
+in a country, would infringe one or more identifiable patents in that
+country that you have reason to believe are valid.
+
+  If, pursuant to or in connection with a single transaction or
+arrangement, you convey, or propagate by procuring conveyance of, a
+covered work, and grant a patent license to some of the parties
+receiving the covered work authorizing them to use, propagate, modify
+or convey a specific copy of the covered work, then the patent license
+you grant is automatically extended to all recipients of the covered
+work and works based on it.
+
+  A patent license is "discriminatory" if it does not include within
+the scope of its coverage, prohibits the exercise of, or is
+conditioned on the non-exercise of one or more of the rights that are
+specifically granted under this License.  You may not convey a covered
+work if you are a party to an arrangement with a third party that is
+in the business of distributing software, under which you make payment
+to the third party based on the extent of your activity of conveying
+the work, and under which the third party grants, to any of the
+parties who would receive the covered work from you, a discriminatory
+patent license (a) in connection with copies of the covered work
+conveyed by you (or copies made from those copies), or (b) primarily
+for and in connection with specific products or compilations that
+contain the covered work, unless you entered into that arrangement,
+or that patent license was granted, prior to 28 March 2007.
+
+  Nothing in this License shall be construed as excluding or limiting
+any implied license or other defenses to infringement that may
+otherwise be available to you under applicable patent law.
+
+  12. No Surrender of Others' Freedom.
+
+  If conditions are imposed on you (whether by court order, agreement or
+otherwise) that contradict the conditions of this License, they do not
+excuse you from the conditions of this License.  If you cannot convey a
+covered work so as to satisfy simultaneously your obligations under this
+License and any other pertinent obligations, then as a consequence you may
+not convey it at all.  For example, if you agree to terms that obligate you
+to collect a royalty for further conveying from those to whom you convey
+the Program, the only way you could satisfy both those terms and this
+License would be to refrain entirely from conveying the Program.
+
+  13. Use with the GNU Affero General Public License.
+
+  Notwithstanding any other provision of this License, you have
+permission to link or combine any covered work with a work licensed
+under version 3 of the GNU Affero General Public License into a single
+combined work, and to convey the resulting work.  The terms of this
+License will continue to apply to the part which is the covered work,
+but the special requirements of the GNU Affero General Public License,
+section 13, concerning interaction through a network will apply to the
+combination as such.
+
+  14. Revised Versions of this License.
+
+  The Free Software Foundation may publish revised and/or new versions of
+the GNU General Public License from time to time.  Such new versions will
+be similar in spirit to the present version, but may differ in detail to
+address new problems or concerns.
+
+  Each version is given a distinguishing version number.  If the
+Program specifies that a certain numbered version of the GNU General
+Public License "or any later version" applies to it, you have the
+option of following the terms and conditions either of that numbered
+version or of any later version published by the Free Software
+Foundation.  If the Program does not specify a version number of the
+GNU General Public License, you may choose any version ever published
+by the Free Software Foundation.
+
+  If the Program specifies that a proxy can decide which future
+versions of the GNU General Public License can be used, that proxy's
+public statement of acceptance of a version permanently authorizes you
+to choose that version for the Program.
+
+  Later license versions may give you additional or different
+permissions.  However, no additional obligations are imposed on any
+author or copyright holder as a result of your choosing to follow a
+later version.
+
+  15. Disclaimer of Warranty.
+
+  THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY
+APPLICABLE LAW.  EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT
+HOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM "AS IS" WITHOUT WARRANTY
+OF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,
+THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+PURPOSE.  THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM
+IS WITH YOU.  SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF
+ALL NECESSARY SERVICING, REPAIR OR CORRECTION.
+
+  16. Limitation of Liability.
+
+  IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING
+WILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS
+THE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY
+GENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+USE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF
+DATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD
+PARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS),
+EVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGES.
+
+  17. Interpretation of Sections 15 and 16.
+
+  If the disclaimer of warranty and limitation of liability provided
+above cannot be given local legal effect according to their terms,
+reviewing courts shall apply local law that most closely approximates
+an absolute waiver of all civil liability in connection with the
+Program, unless a warranty or assumption of liability accompanies a
+copy of the Program in return for a fee.
+
+                     END OF TERMS AND CONDITIONS
+
+            How to Apply These Terms to Your New Programs
+
+  If you develop a new program, and you want it to be of the greatest
+possible use to the public, the best way to achieve this is to make it
+free software which everyone can redistribute and change under these terms.
+
+  To do so, attach the following notices to the program.  It is safest
+to attach them to the start of each source file to most effectively
+state the exclusion of warranty; and each file should have at least
+the "copyright" line and a pointer to where the full notice is found.
+
+    <one line to give the program's name and a brief idea of what it does.>
+    Copyright (C) <year>  <name of author>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Also add information on how to contact you by electronic and paper mail.
+
+  If the program does terminal interaction, make it output a short
+notice like this when it starts in an interactive mode:
+
+    <program>  Copyright (C) <year>  <name of author>
+    This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.
+    This is free software, and you are welcome to redistribute it
+    under certain conditions; type `show c' for details.
+
+The hypothetical commands `show w' and `show c' should show the appropriate
+parts of the General Public License.  Of course, your program's commands
+might be different; for a GUI interface, you would use an "about box".
+
+  You should also get your employer (if you work as a programmer) or school,
+if any, to sign a "copyright disclaimer" for the program, if necessary.
+For more information on this, and how to apply and follow the GNU GPL, see
+<https://www.gnu.org/licenses/>.
+
+  The GNU General Public License does not permit incorporating your program
+into proprietary programs.  If your program is a subroutine library, you
+may consider it more useful to permit linking proprietary applications with
+the library.  If this is what you want to do, use the GNU Lesser General
+Public License instead of this License.  But first, please read
+<https://www.gnu.org/licenses/why-not-lgpl.html>.
+</file>
+
+<file path="multi_task.py">
+import asyncio
+import os
+import json
+from browser_use import Agent, BrowserProfile
+from browser_use import ChatOllama
+from compressor import Compressor
+async def main():
+    #llm2=ChatOllama(model='gpt-oss:20b-cloud')
+    llm2=ChatOllama(model='llama3.1:8b')
+    browser_profile = BrowserProfile(
+        minimum_wait_page_load_time=0.1,
+        wait_between_actions=0.1,
+        headless=False,
+    )
+    compressor=Compressor()
+
+    while True:
+        task=input(">>> ")
+        print(f"Compressed Task: {compressor.compress_prompt(task)}")
+        task+=(f" results in strict JSON format, no text I just strictly need JSON Outputs, Use google to check relevance and up to date info")
+        agent = Agent(
+            task=task,
+            llm=llm2,
+            flash_mode=True,
+            browser_profile=browser_profile,
+        )
+        history = await agent.run()
+        history = history.extracted_content()[-1]
+        history = json.loads(history)
+        print(f"Final result: {history}")
+if __name__ == '__main__':
+	asyncio.run(main())
+</file>
+
+<file path="README.md">
+# Agentic-Surfer
+</file>
+
+<file path="requirements.txt">
+llmlingua
+torch>=2.1.0
+transformers>=4.35.0
+accelerate>=0.24.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+</file>
+
+<file path="single_task.py">
+import asyncio
+import requests
+import json
+from playwright.sync_api import sync_playwright
+import time
+import random
+from agent import mainLLM
+from helper import Helper
+import re
+
+
+import os
+from browser_use import Agent, BrowserProfile
+from browser_use import ChatOllama
+from compressor import Compressor
+
+class SimpleAgent(Helper):
+    def __init__(self):
+        super().__init__() 
+        self.tools = {
+            "search_google_safely": {
+                "method": self.search_google_safely,
+                "description": "Search Google for a query and return top results takes the target query as input string",
+            },
+            "click_result": {
+                "method": self.smart_click,
+                "description": "To click on a search result based on the context provided takes a target as input string",
+            },
+            "extract_data": {
+                "method": self.extract_visible_content,
+                "description": "Extract visible text content from the current page and filters out unnecessary content of the raw webpage"
+            },
+            "close_browser": {
+                "method": self.close,
+                "description": "Close the browser and cleanup resources"
+            },
+            "get_page_info": {
+                "method": self.get_page_info,
+                "description": "Get current page information such as URL, title, and a preview of the content"
+            },
+            "save_results": {
+                "method": self.save_results,
+                "description": "Append results to a local file for record-keeping of current context"
+            }
+        }
+
+    def get_tools_prompt(self):
+        tools_text = ""
+        for tool_name, tool_info in self.tools.items():
+            tools_text += f"• {tool_name}: {tool_info['description']}\n"
+        return tools_text
+    def parse_json(self, text: str):
+        """Extract JSON from LLM response"""
+        try:
+            clean_text = re.sub(r'[^\x00-\x7F]+', '', text)
+            json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+            return {"error": "No JSON found in response"}
+        except Exception as e:
+            return {"error": f"JSON parsing failed: {e}"}
+async def multi_task(task):
+    #llm2=ChatOllama(model='gpt-oss:20b-cloud')
+    llm2=ChatOllama(model='llama3.1:8b')
+    browser_profile = BrowserProfile(
+        minimum_wait_page_load_time=0.1,
+        wait_between_actions=0.1,
+        headless=False,
+    )
+    compressor=Compressor()
+    print(f"Compressed Task: {compressor.compress_prompt(task)}")
+    task+=(f" results in strict JSON format, no text I just strictly need JSON Outputs, Use google to check relevance and up to date info")
+    agent = Agent(
+        task=task,
+        llm=llm2,
+        flash_mode=True,
+        browser_profile=browser_profile,
+    )
+    history = await agent.run()
+    history = history.extracted_content()[-1]
+    history = json.loads(history)
+    print(f"Final result: {history}")
+
+async def single_task(task):
+    agent = SimpleAgent()
+    agent.clear_cookies_and_cache()
+    agent.rotate_user_agent()
+    mainllm = mainLLM()
+    try:
+        available_tools = agent.get_tools_prompt()
+        action_plan_json = mainllm.get_action_plan(task, available_tools)
+        action_plan = agent.parse_json(action_plan_json)
+        print("Action Plan:", json.dumps(action_plan, indent=4))
+        try:
+            results = []
+            ind=0
+            for i, step in enumerate(action_plan.get("steps", [])):
+                print(f"\n{i+1}. ⚡ Executing: {step.get('description', 'Unknown step')}")
+                
+                action = step.get("action", "")
+                if action in agent.tools:
+                    method = agent.tools[action]["method"]
+                    params = {k: v for k, v in step.items() if k not in ["order", "action", "description","executed"]}
+                    print(f"Executing Step {step['order']}: {action} with params {params}")
+                    
+                    if action =="extract_data" or action =="get_page_info":
+                        result=method()
+                        results.append({"index":ind+1,"result": result})
+                        ind+=1
+                    elif action =="save_results":
+                        results.append({"index":ind+1,"result": results})
+                        ind+=1
+                    else:
+                        result = method(**params) if params else method()
+                    print(f"✅ Step {i+1} completed")
+                    page_content = str(result).lower()
+                    if "unusual traffic" in page_content or "blocked" in page_content or "captcha" in page_content:
+                        print("\n🚫 We've been blocked! Please solve the CAPTCHA manually.")
+                        print("Press Enter to continue after solving...")
+                        input()
+                else:
+                    print(f"❌ Unknown action: {action}")
+            
+            print("\n📊 Analyzing final results...")
+            final_content = agent.extract_visible_content()
+
+            if not final_content:
+                print("❌ No final content extracted")
+                final_results = {"error": "No content extracted"}
+            else:
+                results_str = "\n".join([f"Step {r['index']} : {r['result']}" for r in results])
+                final_response = mainllm.extract_final_data( results_str, input_query)
+                print(final_response)
+            
+        except Exception as e:
+            print(f"❌ Error during execution: {e}")
+    except KeyboardInterrupt:
+        print("Exiting...")
+    finally:    
+        agent.close()
+    
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class QueryRequest(BaseModel):
+    mode: int
+    query: str
+
+class QueryResponse(BaseModel):
+    status: str
+    message: str
+    result: dict | None = None
+    error: str | None = None
+
+@app.post("/query", response_model=QueryResponse)
+async def handle_query(request: QueryRequest):
+    print("Reveived")
+    try:
+        if request.mode == 0:
+            result = await single_task(request.query)
+            return QueryResponse(status="success",
+                                 message="Single task completed successfully",
+                                 result=result)
+        elif request.mode == 1:
+            result = await multi_task(request.query)
+            return QueryResponse(status="success",
+                                 message="Multi task completed successfully",
+                                 result=result)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid mode. Use 0 or 1")
+    except Exception as e:
+        return QueryResponse(status="error",
+                             message="An error occurred during processing",
+                             error=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000, reload=False)
+</file>
+
+<file path=".gitignore">
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py.cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+#   For a library or package, you might want to ignore these files since the code is
+#   intended to run in multiple environments; otherwise, check them in:
+# .python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
+#   However, in case of collaboration, if having platform-specific dependencies or dependencies
+#   having no cross-platform support, pipenv may install dependencies that don't work, or not
+#   install all needed dependencies.
+#Pipfile.lock
+
+# UV
+#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+#uv.lock
+
+# poetry
+#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
+#   This is especially recommended for binary packages to ensure reproducibility, and is more
+#   commonly ignored for libraries.
+#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
+#poetry.lock
+#poetry.toml
+
+# pdm
+#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
+#   pdm recommends including project-wide configuration in pdm.toml, but excluding .pdm-python.
+#   https://pdm-project.org/en/latest/usage/project/#working-with-version-control
+#pdm.lock
+#pdm.toml
+.pdm-python
+.pdm-build/
+
+# pixi
+#   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
+#pixi.lock
+#   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
+#   in the .venv directory. It is recommended not to include this directory in version control.
+.pixi
+
+# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.envrc
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+flan-t5-small
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
+#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
+#  and can be added to the global gitignore or merged into this file.  For a more nuclear
+#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
+#.idea/
+
+# Abstra
+# Abstra is an AI-powered process automation framework.
+# Ignore directories containing user credentials, local state, and settings.
+# Learn more at https://abstra.io/docs
+.abstra/
+
+# Visual Studio Code
+#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
+#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#  you could uncomment the following to ignore the entire vscode folder
+# .vscode/
+
+# Ruff stuff:
+.ruff_cache/
+
+# PyPI configuration file
+.pypirc
+
+# Cursor
+#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
+#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
+#  refer to https://docs.cursor.com/context/ignore-files
+.cursorignore
+.cursorindexingignore
+
+# Marimo
+marimo/_static/
+marimo/_lsp/
+__marimo__/
+</file>
+
+<file path="agent.py">
+import ollama
+import re
+
+class mainLLM:
+    def __init__(self):
+        self.model = "gemma3:4b"
+    
+    def call_llm(self, prompt: str):
+        try:
+            response = ollama.generate(model=self.model, prompt="prompt")
+            result = response['response']
+            return result
+        except Exception as e:
+            return f"Error: {e}"
+    
+    def get_action_plan(self, user_input: str, available_tools: str):
+        prompt = f"""
+        you have access to those tools for web navigation and data extraction from the browser environment:
+        {available_tools}
+        User wants to: {user_input}
+        Create a complete web navigation plan To get the required information from the web. Return ONLY JSON:
+        {{
+            "goal": "{user_input}",
+            "steps": [
+                {{  
+                    "order": 1,
+                    "action": "search_google_safely",
+                    "query": "search query",
+                    "description": "What to look for in the search results"
+                }},
+                {{
+                    "order": 2,
+                    "action": "click_result", 
+                    "target": "which result to click",
+                    "description": "navigate to specific site"
+                }},
+                {{
+                    "order": 3,
+                    "action": "extract_data",
+                    "what": "what information to extract",
+                    "description": "final data extraction"
+                }}
+                ... and so on up to 7 steps max.
+            ]
+        }}
+        note:
+        -The target in the click_result should be an element that should be available on the page after the search or an element that is likely to be present on the page.
+        -make use of save_results action to store intermediate results if needed.
+        -You should even go to new page and again search for something else if needed to achieve the goal.
+        Keep it to min 3-7 steps max. Be specific about search queries and targets.
+        """
+        return self.call_llm(prompt)
+    
+    def extract_final_data(self, content: str, original_goal: str):
+        """Final call to extract structured data"""
+        prompt = f"""
+        - You are an very useful agent that gives structured outputs as strict json structure to users.
+        - Prompt by user (Original goal): {original_goal}
+        - Resutls we have by browsing the web: {content[:1500]}
+        - This will be the last output that will be directly given to the user based on the question and the response collected from the web.
+          so make sure you create proper json out of this thing okay.
+        """
+        #return 
+        return self.call_llm(prompt)
+</file>
+
+</files>
