@@ -59,6 +59,9 @@ class mainLLM:
         - Resutls we have by browsing the web: {content[:1500]}
         - This will be the last output that will be directly given to the user based on the question and the response collected from the web.
           so make sure you create proper json out of this thing okay.
+          The content in the json structure result field should be humanized properly okay 
+          so the structure is{{"input":{original_goal}, "output":{content[:500]}(should be properly humanized dont provide unstructured data please)}}
+        - Please dont write anythign else in the ouput i just want you to give me the json  with input and output field the output must be humanized as per the resutls obtained from the web
         """
         #return 
         return self.call_llm(prompt)

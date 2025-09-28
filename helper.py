@@ -1,22 +1,14 @@
 import asyncio
-import aiofiles
+import requests
 import json
-from playwright.async_api import async_playwright
+from playwright.sync_api import sync_playwright
 import time
 import random
 import re
-
-class AsyncHelper:
+class Helper():
     def __init__(self):
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
-
-    async def setup(self):
-        """Async setup for browser"""
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(
             headless=False,
             args=[
                 '--disable-blink-features=AutomationControlled',
@@ -26,14 +18,12 @@ class AsyncHelper:
                 '--disable-renderer-backgrounding'
             ]
         )
-        
         user_agents = [
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ]
-        
-        self.context = await self.browser.new_context(
+        self.context = self.browser.new_context(
             viewport={"width": 1366, "height": 768},
             user_agent=random.choice(user_agents),
             extra_http_headers={
@@ -45,74 +35,71 @@ class AsyncHelper:
                 "Upgrade-Insecure-Requests": "1",
             }
         )
-        self.page = await self.context.new_page()
-        await self.page.add_init_script("""
+        self.page = self.context.new_page()
+        self.page.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {
                 get: () => undefined,
             })
         """)
-
-    async def save_results(self):
+    def save_results(self):
         try:
-            async with aiofiles.open("results_log.txt", "a") as f:
-                await f.write(f"URL: {self.page.url}\n")
-                await f.write(f"Title: {await self.page.title()}\n")
-                content = await self.extract_visible_content()
-                await f.write(f"Content Preview: {content[:500]}\n")
-                await f.write("="*50 + "\n")
+            with open("results_log.txt", "a") as f:
+                f.write(f"URL: {self.page.url}\n")
+                f.write(f"Title: {self.page.title()}\n")
+                f.write(f"Content Preview: {self.extract_visible_content()[:500]}\n")
+                f.write("="*50 + "\n")
             return "Results saved to results_log.txt"
         except Exception as e:
             return f"Error saving results: {e}"
-
-    async def human_like_delay(self, min_sec=1, max_sec=4):
+    def human_like_delay(self, min_sec=1, max_sec=4):
         base_delay = random.uniform(min_sec, max_sec)
-        await asyncio.sleep(base_delay)
+        chunks = max(1, int(base_delay))
+        for _ in range(chunks):
+            time.sleep(base_delay / chunks)
+            if random.random() > 0.7:
+                time.sleep(random.uniform(0.1, 0.3))
 
-    async def human_like_mouse_movement(self):
+    def human_like_mouse_movement(self):
         try:
+
             for _ in range(3):
                 x = random.randint(100, 1200)
                 y = random.randint(100, 600)
-                await self.page.mouse.move(x, y)
-                await asyncio.sleep(0.2)
+                self.page.mouse.move(x, y)
+                time.sleep(0.2)
         except:
             pass
-
-    async def search_google_safely(self, query: str):
+    
+    def search_google_safely(self, query: str):
         try:
             print(f"🔍 Searching for: {query}")
-            await self.page.goto("https://www.wikipedia.org", wait_until="networkidle")
-            await self.human_like_delay(1, 2)
-            await self.page.goto("https://www.google.com", wait_until="networkidle")
-            await self.human_like_delay(1, 3)
-            
+            self.page.goto("https://www.wikipedia.org", wait_until="networkidle")
+            self.human_like_delay(1, 2)
+            self.page.goto("https://www.google.com", wait_until="networkidle")
+            self.human_like_delay(1, 3)
             search_box = "textarea[name='q'], input[name='q']"
-            await self.page.wait_for_selector(search_box, timeout=10000)
-            await self.page.click(search_box)
-            await self.human_like_delay(0.5, 1)
-            
+            self.page.wait_for_selector(search_box, timeout=10000)
+            self.page.click(search_box)
+            self.human_like_delay(0.5, 1)
             for i, char in enumerate(query):
-                await self.page.type(search_box, char, delay=random.randint(80, 200))
+                self.page.type(search_box, char, delay=random.randint(80, 200))
                 if random.random() > 0.9:
-                    await self.human_like_delay(0.1, 0.4)
+                    self.human_like_delay(0.1, 0.4)
                 if i % 5 == 0:
-                    await self.human_like_mouse_movement()
-                    
-            await self.human_like_delay(1, 2)
-            await self.page.press(search_box, "Enter")
-            await self.human_like_delay(1, 4)
-            
-            content = await self.page.content()
-            content_lower = content.lower()
-            if any(blocked in content_lower for blocked in ["unusual traffic", "detected unusual traffic", "captcha"]):
+                    self.human_like_mouse_movement()
+            self.human_like_delay(1, 2)
+            self.page.press(search_box, "Enter")
+            self.human_like_delay(1, 4)
+            content = self.page.content().lower()
+            if any(blocked in content for blocked in ["unusual traffic", "detected unusual traffic", "captcha"]):
                 print("🚫 Blocked by Google. Trying alternative approach...")
-                return await self.use_alternative_search_engine(query)
+                return self.use_alternative_search_engine(query)
             
-            return await self.get_page_info()
+            return self.get_page_info()
         except Exception as e:
             return {"error": str(e)}
-
-    async def use_alternative_search_engine(self, query: str):
+    
+    def use_alternative_search_engine(self, query: str):
         alternatives = [
             ("https://search.yahoo.com", "input[name='p']"),
             ("https://duckduckgo.com", "input[name='q']"),
@@ -120,96 +107,76 @@ class AsyncHelper:
         ]
         for url, selector in alternatives:
             try:
-                await self.page.goto(url, wait_until="networkidle")
-                await self.page.fill(selector, query)
-                await self.page.press(selector, "Enter")
-                await self.human_like_delay(2, 4)
-                return await self.get_page_info()
+                self.page.goto(url, wait_until="networkidle")
+                self.page.fill(selector, query)
+                self.page.press(selector, "Enter")
+                return self.get_page_info()
             except:
                 continue
         return {"error": "All search engines blocked"}
-
-    async def smart_click(self, target: str):
+    
+    def smart_click(self, target: str):
         strategies = [
             f"a:has-text('{target}')",
             f"h3:has-text('{target}')",
             f"div:has-text('{target}')",
             f"span:has-text('{target}')",
             f"button:has-text('{target}')",
+            f"a:has-text(/:.*{target}.*/i)",
+            f"h3:has-text(/:.*{target}.*/i)",
         ]
         
         for selector in strategies:
             try:
-                if await self.page.locator(selector).count() > 0:
-                    await self.human_like_mouse_movement()
-                    await self.page.click(selector)
-                    await self.human_like_delay(1, 2)
-                    return await self.get_page_info()
+                if self.page.locator(selector).count() > 0:
+                    self.human_like_mouse_movement()
+                    self.page.click(selector)
+                    self.human_like_delay(1, 2)
+                    if self.page.url != self.page.context.pages[0].url:
+                        return self.get_page_info()
             except:
                 continue
         return "Click failed - element not found"
 
-    async def extract_visible_content(self):
+    def extract_visible_content(self):
         try:
-            data = await self.page.evaluate("""
+            content = self.page.evaluate("""
                 () => {
-                    const tags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a'];
-                    const result = [];
-
-                    tags.forEach(tagName => {
-                        const nodes = document.querySelectorAll(tagName);
-                        nodes.forEach(node => {
-                            const text = node.innerText?.trim() || '';
-                            const id = node.id || null;
-                            const className = node.className || null;
-                            let href = null;
-                            if (tagName === 'a') {
-                                href = node.getAttribute('href');
-                            }
-                            result.push({
-                                tag: tagName,
-                                text: text,
-                                id: id,
-                                class: className,
-                                href: href
-                            });
-                        });
-                    });
-
-                    return result;
+                    const elementsToRemove = document.querySelectorAll('script, style, nav, footer, header');
+                    elementsToRemove.forEach(el => el.remove());
+                    return document.body.innerText;
                 }
             """)
-            return data
+            lines = [line.strip() for line in content.split('\n') if line.strip()]
+            clean_content = '\n'.join(lines[:100])
+            return clean_content[:2000]
         except Exception as e:
-            return f"Extraction error: {e}"
-
-    async def get_page_info(self):
+            return f"Extraction error: {e}" 
+    def get_page_info(self):
         try:
-            content = await self.extract_visible_content()
             return {
                 "url": self.page.url,
-                "title": await self.page.title(),
-                "content_preview": content[:500] if content else ""
+                "title": self.page.title(),
+                "content_preview": self.extract_visible_content()[:500]
             }
         except:
             return {"error": "Could not get page info"}
+    
+    def close(self):
+        self.browser.close()
+        self.playwright.stop()
 
-    async def close(self):
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
-
-    async def clear_cookies_and_cache(self):
+    def clear_cookies_and_cache(self):
         """Clear cookies and cache between sessions"""
         try:
-            await self.context.clear_cookies()
-            await self.page.evaluate("() => localStorage.clear()")
-            await self.page.evaluate("() => sessionStorage.clear()")
+            self.context.clear_cookies()
+            # Add storage cleanup if needed
+            self.page.evaluate("() => localStorage.clear()")
+            self.page.evaluate("() => sessionStorage.clear()")
         except:
             pass
 
-    async def rotate_user_agent(self):
+    def rotate_user_agent(self):
         """Rotate user agent for new sessions"""
         user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -217,4 +184,4 @@ class AsyncHelper:
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
         ]
         new_agent = random.choice(user_agents)
-        await self.context.set_extra_http_headers({'User-Agent': new_agent})
+        self.context.set_extra_http_headers({'User-Agent': new_agent})
