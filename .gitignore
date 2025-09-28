@@ -5,7 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+repomix-output.xml
 # Distribution / packaging
 .Python
 build/
