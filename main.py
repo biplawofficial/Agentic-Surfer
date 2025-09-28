@@ -15,18 +15,13 @@ import json
 from browser_use import Agent, BrowserProfile
 from browser_use import ChatOllama
 from compressor import Compressor
-<<<<<<< HEAD
 
-=======
 from fastapi.middleware.cors import CORSMiddleware
->>>>>>> d5d9f85 (Enhanced UI)
 from fastapi import FastAPI
 from pydantic import BaseModel
 import io
 import contextlib
 
-<<<<<<< HEAD
-=======
 app = FastAPI()
 
 # CORS middleware
@@ -39,7 +34,6 @@ app.add_middleware(
     allow_headers=["*"],    # sab headers allow
 )
 
->>>>>>> d5d9f85 (Enhanced UI)
 class SimpleAgent(Helper):
     def __init__(self):
         super().__init__() 
@@ -170,11 +164,7 @@ async def multi(task):
     history = history.extracted_content()[-1]
     history = json.loads(history)
     return history
-<<<<<<< HEAD
 app = FastAPI()
-=======
-#app = FastAPI()
->>>>>>> d5d9f85 (Enhanced UI)
 
 class QueryRequest(BaseModel):
     query: str
@@ -207,8 +197,4 @@ def handle_query(request: QueryRequest):
 
 if __name__ == "__main__":
     import uvicorn
-<<<<<<< HEAD
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
-=======
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
->>>>>>> d5d9f85 (Enhanced UI)
