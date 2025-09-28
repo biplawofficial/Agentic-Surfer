@@ -21,7 +21,7 @@ This project requires setting up **two separate environments**: the Python Backe
 
 ### **Prerequisites**
 
-1.  **Python 3.8+**
+1.  **Python 3.11+**
 2.  **Node.js (LTS recommended)**
 3.  **Ollama Server:** The backend relies on an active Ollama instance running locally.
 
