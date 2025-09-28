@@ -62,250 +62,16 @@ frontend/
   README.md
 .gitignore
 agent.py
-api.py
 compressor.py
 helper.py
 LICENSE
-multi_task.py
+main.py
 README.md
 requirements.txt
-single_task.py
 </directory_structure>
 
 <files>
 This section contains the contents of the repository's files.
-
-<file path="api.py">
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import asyncio
-import json
-import re
-import time
-from agent import mainLLM
-from helper import AsyncHelper  # Changed import
-from compressor import Compressor
-from browser_use import Agent, BrowserProfile, ChatOllama
-
-app = FastAPI(title="Agentic Surfer API",
-              description="Web automation and data extraction API")
-
-# Allow frontend connections
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-class QueryRequest(BaseModel):
-    mode: int  # 0 = single_task, 1 = multi_task
-    query: str
-
-class QueryResponse(BaseModel):
-    status: str
-    message: str
-    result: dict | None = None
-    error: str | None = None
-
-
-# ---------- Single Task Agent ----------
-class SimpleAgent(AsyncHelper):  # Now inherits from AsyncHelper
-    def __init__(self):
-        super().__init__()
-        self.tools = {
-            "search_google_safely": {
-                "method": self.search_google_safely,
-                "description": "Search Google for a query and return top results."
-            },
-            "click_result": {
-                "method": self.smart_click,
-                "description": "Click on a search result by context."
-            },
-            "extract_data": {
-                "method": self.extract_visible_content,
-                "description": "Extract visible text from the current page."
-            },
-            "close_browser": {
-                "method": self.close,
-                "description": "Close browser and cleanup."
-            },
-            "get_page_info": {
-                "method": self.get_page_info,
-                "description": "Get current page URL, title and content preview."
-            },
-            "save_results": {
-                "method": self.save_results,
-                "description": "Append results to a local file."
-            }
-        }
-
-    def get_tools_prompt(self) -> str:
-        return "\n".join(
-            f"• {name}: {info['description']}"
-            for name, info in self.tools.items()
-        )
-
-    @staticmethod
-    def parse_json(text: str):
-        """Extract JSON from an LLM response string."""
-        try:
-            clean_text = re.sub(r"[^\x00-\x7F]+", "", text)
-            match = re.search(r"\{[^{}]*\{[^{}]*\}[^{}]*\}|\{[^{}]*\}", clean_text, re.DOTALL)
-            if match:
-                return json.loads(match.group())
-            return {"error": "No valid JSON found in response"}
-        except json.JSONDecodeError as e:
-            return {"error": f"JSON parsing failed: {e}"}
-        except Exception as e:
-            return {"error": f"Unexpected error: {e}"}
-
-
-async def run_single_task(query: str) -> dict:
-    """Run single task mode."""
-    agent = SimpleAgent()
-    await agent.setup()
-    await agent.clear_cookies_and_cache()
-    await agent.rotate_user_agent()
-    mainllm = mainLLM()
-    try:
-        available_tools = agent.get_tools_prompt()
-        plan_json = mainllm.get_action_plan(query, available_tools)
-        action_plan = agent.parse_json(plan_json)
-
-        if "error" in action_plan:
-            return {"error": f"Failed to create action plan: {action_plan['error']}"}
-
-        results = []
-        for idx, step in enumerate(action_plan.get("steps", []), start=1):
-            print(f"\n{idx}. Executing: {step.get('description', 'Unknown step')}")
-            action = step.get("action", "")
-            
-            if action not in agent.tools:
-                print(f"❌ Unknown action: {action}")
-                continue
-
-            method = agent.tools[action]["method"]
-            params = {
-                k: v for k, v in step.items()
-                if k not in {"order", "action", "description", "executed"}
-            }
-            try:
-                if action in {"extract_data", "get_page_info"}:
-                    result = await method()
-                    results.append({"index": idx, "result": result})
-                elif action == "save_results":
-                    result = await method() 
-                    results.append({"index": idx, "result": result})
-                else:
-
-                    result = await method(**params) if params else await method()
-                    results.append({"index": idx, "result": result})
-
-                print(f"✅ Step {idx} completed")
-                
-            except Exception as e:
-                print(f"❌ Error in step {idx}: {e}")
-                results.append({"index": idx, "error": str(e)})
-
-        print("\nAnalyzing final results...")
-        final_content = await agent.extract_visible_content()
-        if not final_content:
-            return {"error": "No content extracted", "steps_executed": len(results)}
-        results_str = "\n".join(
-            f"Step {r['index']}: {r.get('result', r.get('error', 'No result'))}" 
-            for r in results
-        )
-        final_response = mainllm.extract_final_data(results_str, query)
-        return {
-            "response": final_response, 
-            "detailed_results": results
-        }
-
-    except Exception as e:
-        return {"error": f"Error during execution: {e}"}
-    finally:
-        await agent.close() 
-
-
-# ---------- Multi Task Agent ----------
-async def run_multi_task(query: str) -> dict:
-    """Run multi task mode."""
-    try:
-        llm2 = ChatOllama(model="gpt-oss:20b-cloud")
-        browser_profile = BrowserProfile(
-            minimum_wait_page_load_time=0.1,
-            wait_between_actions=0.1,
-            headless=False,
-        )
-        compressor = Compressor()
-
-        print(f"Original Task: {query}")
-        compressed_task = compressor.compress_prompt(query)
-        print(f"Compressed Task: {compressed_task}")
-
-        task = query + (
-            " results in strict JSON format, no text I just strictly need JSON Outputs,"
-            " Use google to check relevance and up to date info"
-        )
-
-        agent = Agent(
-            task=task,
-            llm=llm2,
-            flash_mode=True,
-            browser_profile=browser_profile,
-        )
-
-        history = await agent.run()
-        extracted_content = history.extracted_content()
-        
-        if not extracted_content:
-            return {"error": "No content extracted from multi-task agent"}
-            
-        history = extracted_content[-1]
-        
-        try:
-            return json.loads(history)
-        except json.JSONDecodeError:
-            return {"raw_response": history}
-
-    except Exception as e:
-        return {"error": f"Error in multi-task execution: {e}"}
-
-
-# ---------- Routes ----------
-@app.post("/query", response_model=QueryResponse)
-async def handle_query(request: QueryRequest):
-    """Handle user queries for web automation tasks."""
-    try:
-        if request.mode == 0:
-            result = await run_single_task(request.query)
-            if "error" in result:
-                return QueryResponse(status="error", message=result["error"])
-            return QueryResponse(status="success",
-                               message="Single task completed successfully",
-                               result=result)
-        elif request.mode == 1:
-            result = await run_multi_task(request.query)
-            if "error" in result:
-                return QueryResponse(status="error", message=result["error"])
-            return QueryResponse(status="success",
-                               message="Multi task completed successfully",
-                               result=result)
-        else:
-            raise HTTPException(status_code=400,
-                              detail="Invalid mode. Use 0 for single_task or 1 for multi_task")
-    except Exception as e:
-        return QueryResponse(status="error",
-                           message="An error occurred during processing",
-                           error=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-</file>
 
 <file path="frontend/public/models/robot/license.txt">
 Model Information:
@@ -708,239 +474,6 @@ createRoot(document.getElementById('root')).render(
 )
 </file>
 
-<file path="frontend/src/SpeechStudio.jsx">
-import React, { useState, useRef, useEffect } from "react";
-import { Canvas, useFrame } from "@react-three/fiber";
-import { Mic, Send } from "lucide-react";
-import * as THREE from "three";
-
-// Particle effect
-function VoiceParticles({ audioData, chatBoxRef }) {
-  const pointsRef = useRef();
-  const particleCount = 600;
-  const positions = useRef(new Float32Array(particleCount * 3));
-  const colors = useRef(new Float32Array(particleCount * 3));
-  const velocities = useRef(new Float32Array(particleCount));
-
-  // Initialize particles
-  useEffect(() => {
-    const chatBox = chatBoxRef.current;
-    const rect = chatBox?.getBoundingClientRect() || { bottom: 0 };
-    const startY = (rect.bottom / window.innerHeight) * 5 - 2.5;
-
-    for (let i = 0; i < particleCount; i++) {
-      positions.current[i * 3] = (Math.random() - 0.5) * 6;
-      positions.current[i * 3 + 1] = startY;
-      positions.current[i * 3 + 2] = (Math.random() - 0.5) * 1;
-      velocities.current[i] = 0.02 + Math.random() * 0.02;
-
-      const color = new THREE.Color();
-      color.setHSL(Math.random(), 1, 0.5);
-      colors.current[i * 3] = color.r;
-      colors.current[i * 3 + 1] = color.g;
-      colors.current[i * 3 + 2] = color.b;
-    }
-  }, [chatBoxRef]);
-
-  useFrame(() => {
-    if (!pointsRef.current) return;
-    const amp = (audioData.current || 0) / 80;
-
-    for (let i = 0; i < particleCount; i++) {
-      const ix = i * 3;
-      positions.current[ix + 1] += velocities.current[i] * (1 + amp * 4);
-      positions.current[ix + 0] += Math.sin(Date.now() * 0.001 + ix) * 0.002;
-      positions.current[ix + 2] += Math.cos(Date.now() * 0.001 + ix) * 0.002;
-
-      if (positions.current[ix + 1] > 5) {
-        const chatBox = chatBoxRef.current;
-        const rect = chatBox?.getBoundingClientRect() || { bottom: 0 };
-        positions.current[ix + 1] = (rect.bottom / window.innerHeight) * 5 - 2.5;
-        positions.current[ix + 0] = (Math.random() - 0.5) * 6;
-        positions.current[ix + 2] = (Math.random() - 0.5) * 1;
-      }
-    }
-
-    pointsRef.current.geometry.attributes.position.needsUpdate = true;
-  });
-
-  return (
-    <points ref={pointsRef}>
-      <bufferGeometry>
-        <bufferAttribute
-          attach="attributes-position"
-          count={particleCount}
-          array={positions.current}
-          itemSize={3}
-        />
-        <bufferAttribute
-          attach="attributes-color"
-          count={particleCount}
-          array={colors.current}
-          itemSize={3}
-        />
-      </bufferGeometry>
-      <pointsMaterial vertexColors size={0.15} transparent opacity={0.9} />
-    </points>
-  );
-}
-
-export default function SpeechStudio() {
-  const [text, setText] = useState("");
-  const [messages, setMessages] = useState([]);
-  const [lang, setLang] = useState("en-US");
-  const audioData = useRef(0);
-  const chatBoxRef = useRef();
-
-  // Microphone & audio analyser
-  useEffect(() => {
-    async function initMic() {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        const source = audioCtx.createMediaStreamSource(stream);
-        const analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 256;
-        source.connect(analyser);
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-
-        const updateAudio = () => {
-          analyser.getByteFrequencyData(dataArray);
-          audioData.current = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-          requestAnimationFrame(updateAudio);
-        };
-        updateAudio();
-      } catch {
-        alert("Allow microphone access for live particle effects.");
-      }
-    }
-    initMic();
-  }, []);
-
-  const speakText = (message) => {
-    const ttsLang = lang === "bho-IN" ? "hi-IN" : lang;
-    const utter = new SpeechSynthesisUtterance(message);
-    utter.lang = ttsLang;
-    const voices = window.speechSynthesis.getVoices();
-    const voice = voices.find((v) => v.lang === ttsLang);
-    if (voice) utter.voice = voice;
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(utter);
-  };
-
-  // ✅ Backend call
-  const sendToBackend = async (query) => {
-    try {
-      const res = await fetch("http://127.0.0.1:8000/query", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode:1,query: query }),
-      });
-      const data = await res.json();
-      print(data)
-      const reply = typeof data.reply === "string" ? data.reply : JSON.stringify(data.reply);
-      setMessages((prev) => [...prev, { role: "bot", content: reply }]);
-      speakText(reply);
-    } catch (err) {
-      console.error("Error:", err);
-      setMessages((prev) => [...prev, { role: "bot", content: "❌ Backend error" }]);
-    }
-  };
-
-  const handleSend = () => {
-    if (!text.trim()) return;
-    const userMessage = text;
-    setMessages((prev) => [...prev, { role: "user", content: userMessage }]);
-    setText("");
-    sendToBackend(userMessage);
-  };
-
-  const startRecognition = () => {
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) return alert("Speech recognition not supported.");
-    const recog = new SpeechRecognition();
-    recog.continuous = false;
-    recog.interimResults = false;
-    recog.lang = lang;
-    recog.onresult = (e) => {
-      const transcript = e.results[0][0].transcript;
-      setMessages((prev) => [...prev, { role: "user", content: transcript }]);
-      sendToBackend(transcript);
-    };
-    recog.start();
-  };
-
-  return (
-    <div className="min-h-screen relative bg-gray-900 flex flex-col items-center justify-center p-6 overflow-hidden">
-      {/* Chat UI */}
-      <div
-        ref={chatBoxRef}
-        className="w-full max-w-2xl bg-white rounded-3xl shadow-xl flex flex-col overflow-hidden border border-gray-200 mb-6 z-10 relative"
-      >
-        <div className="flex-1 p-4 overflow-y-auto max-h-96 space-y-3">
-          {messages.length === 0 && <p className="text-gray-400 text-center">No messages yet...</p>}
-          {messages.map((m, i) => (
-            <div
-              key={i}
-              className={`px-4 py-2 rounded-lg max-w-xs break-words ${
-                m.role === "user"
-                  ? "bg-indigo-600 text-white self-end ml-auto"
-                  : "bg-gray-200 text-gray-900 self-start"
-              }`}
-            >
-              {m.content}
-            </div>
-          ))}
-        </div>
-
-        <div className="flex items-center gap-2 p-3 border-t bg-gray-50">
-          <select
-            value={lang}
-            onChange={(e) => setLang(e.target.value)}
-            className="px-3 py-1 rounded-xl border text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
-          >
-            <option value="en-US">English (US)</option>
-            <option value="hi-IN">Hindi</option>
-            <option value="bho-IN">Bhojpuri</option>
-          </select>
-
-          <input
-            type="text"
-            placeholder="Type a message..."
-            className="flex-1 px-4 py-2 rounded-2xl bg-gray-100 border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-400"
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handleSend()}
-          />
-
-          <button
-            onClick={handleSend}
-            className="p-3 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white transition-transform transform hover:scale-105"
-          >
-            <Send size={20} />
-          </button>
-
-          <button
-            onClick={startRecognition}
-            className="p-3 rounded-full bg-green-600 hover:bg-green-500 text-white transition-transform transform hover:scale-105"
-          >
-            <Mic size={20} />
-          </button>
-        </div>
-      </div>
-
-      {/* Particle Canvas */}
-      <Canvas
-        className="absolute top-0 left-0 w-full h-full -z-0 pointer-events-none"
-        camera={{ position: [0, 0, 10], fov: 50 }}
-      >
-        <VoiceParticles audioData={audioData} chatBoxRef={chatBoxRef} />
-      </Canvas>
-    </div>
-  );
-}
-</file>
-
 <file path="frontend/.gitignore">
 # Logs
 logs
@@ -1076,229 +609,6 @@ class Compressor():
         print(f"Stats: {result['origin_tokens']} --> {result['compressed_tokens']} tokens ({result['ratio']})")
         print("------------------------------------------------------------------------------------------------")
         return result['compressed_prompt']
-</file>
-
-<file path="helper.py">
-import asyncio
-import aiofiles
-import json
-from playwright.async_api import async_playwright
-import time
-import random
-import re
-
-class AsyncHelper:
-    def __init__(self):
-        self.playwright = None
-        self.browser = None
-        self.context = None
-        self.page = None
-
-    async def setup(self):
-        """Async setup for browser"""
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(
-            headless=False,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--disable-features=VizDisplayCompositor',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding'
-            ]
-        )
-        
-        user_agents = [
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ]
-        
-        self.context = await self.browser.new_context(
-            viewport={"width": 1366, "height": 768},
-            user_agent=random.choice(user_agents),
-            extra_http_headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
-                "DNT": "1",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-            }
-        )
-        self.page = await self.context.new_page()
-        await self.page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined,
-            })
-        """)
-
-    async def save_results(self):
-        try:
-            async with aiofiles.open("results_log.txt", "a") as f:
-                await f.write(f"URL: {self.page.url}\n")
-                await f.write(f"Title: {await self.page.title()}\n")
-                content = await self.extract_visible_content()
-                await f.write(f"Content Preview: {content[:500]}\n")
-                await f.write("="*50 + "\n")
-            return "Results saved to results_log.txt"
-        except Exception as e:
-            return f"Error saving results: {e}"
-
-    async def human_like_delay(self, min_sec=1, max_sec=4):
-        base_delay = random.uniform(min_sec, max_sec)
-        await asyncio.sleep(base_delay)
-
-    async def human_like_mouse_movement(self):
-        try:
-            for _ in range(3):
-                x = random.randint(100, 1200)
-                y = random.randint(100, 600)
-                await self.page.mouse.move(x, y)
-                await asyncio.sleep(0.2)
-        except:
-            pass
-
-    async def search_google_safely(self, query: str):
-        try:
-            print(f"🔍 Searching for: {query}")
-            await self.page.goto("https://www.wikipedia.org", wait_until="networkidle")
-            await self.human_like_delay(1, 2)
-            await self.page.goto("https://www.google.com", wait_until="networkidle")
-            await self.human_like_delay(1, 3)
-            
-            search_box = "textarea[name='q'], input[name='q']"
-            await self.page.wait_for_selector(search_box, timeout=10000)
-            await self.page.click(search_box)
-            await self.human_like_delay(0.5, 1)
-            
-            for i, char in enumerate(query):
-                await self.page.type(search_box, char, delay=random.randint(80, 200))
-                if random.random() > 0.9:
-                    await self.human_like_delay(0.1, 0.4)
-                if i % 5 == 0:
-                    await self.human_like_mouse_movement()
-                    
-            await self.human_like_delay(1, 2)
-            await self.page.press(search_box, "Enter")
-            await self.human_like_delay(1, 4)
-            
-            content = await self.page.content()
-            content_lower = content.lower()
-            if any(blocked in content_lower for blocked in ["unusual traffic", "detected unusual traffic", "captcha"]):
-                print("🚫 Blocked by Google. Trying alternative approach...")
-                return await self.use_alternative_search_engine(query)
-            
-            return await self.get_page_info()
-        except Exception as e:
-            return {"error": str(e)}
-
-    async def use_alternative_search_engine(self, query: str):
-        alternatives = [
-            ("https://search.yahoo.com", "input[name='p']"),
-            ("https://duckduckgo.com", "input[name='q']"),
-            ("https://www.bing.com", "input[name='q']"),
-        ]
-        for url, selector in alternatives:
-            try:
-                await self.page.goto(url, wait_until="networkidle")
-                await self.page.fill(selector, query)
-                await self.page.press(selector, "Enter")
-                await self.human_like_delay(2, 4)
-                return await self.get_page_info()
-            except:
-                continue
-        return {"error": "All search engines blocked"}
-
-    async def smart_click(self, target: str):
-        strategies = [
-            f"a:has-text('{target}')",
-            f"h3:has-text('{target}')",
-            f"div:has-text('{target}')",
-            f"span:has-text('{target}')",
-            f"button:has-text('{target}')",
-        ]
-        
-        for selector in strategies:
-            try:
-                if await self.page.locator(selector).count() > 0:
-                    await self.human_like_mouse_movement()
-                    await self.page.click(selector)
-                    await self.human_like_delay(1, 2)
-                    return await self.get_page_info()
-            except:
-                continue
-        return "Click failed - element not found"
-
-    async def extract_visible_content(self):
-        try:
-            data = await self.page.evaluate("""
-                () => {
-                    const tags = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a'];
-                    const result = [];
-
-                    tags.forEach(tagName => {
-                        const nodes = document.querySelectorAll(tagName);
-                        nodes.forEach(node => {
-                            const text = node.innerText?.trim() || '';
-                            const id = node.id || null;
-                            const className = node.className || null;
-                            let href = null;
-                            if (tagName === 'a') {
-                                href = node.getAttribute('href');
-                            }
-                            result.push({
-                                tag: tagName,
-                                text: text,
-                                id: id,
-                                class: className,
-                                href: href
-                            });
-                        });
-                    });
-
-                    return result;
-                }
-            """)
-            return data
-        except Exception as e:
-            return f"Extraction error: {e}"
-
-    async def get_page_info(self):
-        try:
-            content = await self.extract_visible_content()
-            return {
-                "url": self.page.url,
-                "title": await self.page.title(),
-                "content_preview": content[:500] if content else ""
-            }
-        except:
-            return {"error": "Could not get page info"}
-
-    async def close(self):
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
-
-    async def clear_cookies_and_cache(self):
-        """Clear cookies and cache between sessions"""
-        try:
-            await self.context.clear_cookies()
-            await self.page.evaluate("() => localStorage.clear()")
-            await self.page.evaluate("() => sessionStorage.clear()")
-        except:
-            pass
-
-    async def rotate_user_agent(self):
-        """Rotate user agent for new sessions"""
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
-        ]
-        new_agent = random.choice(user_agents)
-        await self.context.set_extra_http_headers({'User-Agent': new_agent})
 </file>
 
 <file path="LICENSE">
@@ -1978,70 +1288,29 @@ Public License instead of this License.  But first, please read
 <https://www.gnu.org/licenses/why-not-lgpl.html>.
 </file>
 
-<file path="multi_task.py">
-import asyncio
-import os
-import json
-from browser_use import Agent, BrowserProfile
-from browser_use import ChatOllama
-from compressor import Compressor
-async def main():
-    #llm2=ChatOllama(model='gpt-oss:20b-cloud')
-    llm2=ChatOllama(model='llama3.1:8b')
-    browser_profile = BrowserProfile(
-        minimum_wait_page_load_time=0.1,
-        wait_between_actions=0.1,
-        headless=False,
-    )
-    compressor=Compressor()
-
-    while True:
-        task=input(">>> ")
-        print(f"Compressed Task: {compressor.compress_prompt(task)}")
-        task+=(f" results in strict JSON format, no text I just strictly need JSON Outputs, Use google to check relevance and up to date info")
-        agent = Agent(
-            task=task,
-            llm=llm2,
-            flash_mode=True,
-            browser_profile=browser_profile,
-        )
-        history = await agent.run()
-        history = history.extracted_content()[-1]
-        history = json.loads(history)
-        print(f"Final result: {history}")
-if __name__ == '__main__':
-	asyncio.run(main())
-</file>
-
-<file path="README.md">
-# Agentic-Surfer
-</file>
-
-<file path="requirements.txt">
-llmlingua
-torch>=2.1.0
-transformers>=4.35.0
-accelerate>=0.24.0
-sentencepiece>=0.1.99
-protobuf>=3.20.0
-</file>
-
-<file path="single_task.py">
+<file path="main.py">
 import asyncio
 import requests
 import json
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 import time
 import random
 from agent import mainLLM
 from helper import Helper
 import re
-
-
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
 import os
+import json
 from browser_use import Agent, BrowserProfile
 from browser_use import ChatOllama
 from compressor import Compressor
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+import io
+import contextlib
 
 class SimpleAgent(Helper):
     def __init__(self):
@@ -2078,6 +1347,7 @@ class SimpleAgent(Helper):
         for tool_name, tool_info in self.tools.items():
             tools_text += f"• {tool_name}: {tool_info['description']}\n"
         return tools_text
+
     def parse_json(self, text: str):
         """Extract JSON from LLM response"""
         try:
@@ -2088,36 +1358,15 @@ class SimpleAgent(Helper):
             return {"error": "No JSON found in response"}
         except Exception as e:
             return {"error": f"JSON parsing failed: {e}"}
-async def multi_task(task):
-    #llm2=ChatOllama(model='gpt-oss:20b-cloud')
-    llm2=ChatOllama(model='llama3.1:8b')
-    browser_profile = BrowserProfile(
-        minimum_wait_page_load_time=0.1,
-        wait_between_actions=0.1,
-        headless=False,
-    )
-    compressor=Compressor()
-    print(f"Compressed Task: {compressor.compress_prompt(task)}")
-    task+=(f" results in strict JSON format, no text I just strictly need JSON Outputs, Use google to check relevance and up to date info")
-    agent = Agent(
-        task=task,
-        llm=llm2,
-        flash_mode=True,
-        browser_profile=browser_profile,
-    )
-    history = await agent.run()
-    history = history.extracted_content()[-1]
-    history = json.loads(history)
-    print(f"Final result: {history}")
-
-async def single_task(task):
+    
+def single(input_query):
     agent = SimpleAgent()
     agent.clear_cookies_and_cache()
     agent.rotate_user_agent()
     mainllm = mainLLM()
     try:
         available_tools = agent.get_tools_prompt()
-        action_plan_json = mainllm.get_action_plan(task, available_tools)
+        action_plan_json = mainllm.get_action_plan(input_query, available_tools)
         action_plan = agent.parse_json(action_plan_json)
         print("Action Plan:", json.dumps(action_plan, indent=4))
         try:
@@ -2141,6 +1390,7 @@ async def single_task(task):
                         ind+=1
                     else:
                         result = method(**params) if params else method()
+
                     print(f"✅ Step {i+1} completed")
                     page_content = str(result).lower()
                     if "unusual traffic" in page_content or "blocked" in page_content or "captcha" in page_content:
@@ -2149,64 +1399,318 @@ async def single_task(task):
                         input()
                 else:
                     print(f"❌ Unknown action: {action}")
-            
-            print("\n📊 Analyzing final results...")
             final_content = agent.extract_visible_content()
-
             if not final_content:
-                print("❌ No final content extracted")
                 final_results = {"error": "No content extracted"}
             else:
                 results_str = "\n".join([f"Step {r['index']} : {r['result']}" for r in results])
                 final_response = mainllm.extract_final_data( results_str, input_query)
+                final_response = agent.parse_json(final_response)
                 print(final_response)
-            
+                return(final_response)
         except Exception as e:
             print(f"❌ Error during execution: {e}")
     except KeyboardInterrupt:
         print("Exiting...")
     finally:    
         agent.close()
-    
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+        
 
+async def multi(task):
+    llm2=ChatOllama(model='gpt-oss:20b-cloud')
+    browser_profile = BrowserProfile(
+        minimum_wait_page_load_time=0.1,
+        wait_between_actions=0.1,
+        headless=False,
+    )
+    compressor=Compressor()
+    print(f"Compressed Task: {compressor.compress_prompt(task)}")
+    task+=(f"""
+           - results in strict JSON format, no text I just strictly need JSON Outputs, Use google to check relevance and up to date info.
+           - so the structure is{{"input":{task}, "output":{"results obtained from the web"}(should be properly humanized dont provide unstructured data please)}}
+           - Please dont write anythign else in the ouput i just want you to give me the json  with input and output field the output must be humanized as per the resutls obtained from the web
+           """)
+    agent = Agent(
+        task=task,
+        llm=llm2,
+        flash_mode=True,
+        browser_profile=browser_profile,
+    )
+    history = await agent.run()
+    history = history.extracted_content()[-1]
+    history = json.loads(history)
+    return history
 app = FastAPI()
 
 class QueryRequest(BaseModel):
-    mode: int
     query: str
+    mode: int 
 
-class QueryResponse(BaseModel):
-    status: str
-    message: str
-    result: dict | None = None
-    error: str | None = None
-
-@app.post("/query", response_model=QueryResponse)
-async def handle_query(request: QueryRequest):
-    print("Reveived")
+@app.post("/query")
+def handle_query(request: QueryRequest):
     try:
+        a=""
         if request.mode == 0:
-            result = await single_task(request.query)
-            return QueryResponse(status="success",
-                                 message="Single task completed successfully",
-                                 result=result)
+            a=single(request.query)
+            
         elif request.mode == 1:
-            result = await multi_task(request.query)
-            return QueryResponse(status="success",
-                                 message="Multi task completed successfully",
-                                 result=result)
+            a=asyncio.run(multi(request.query))
         else:
-            raise HTTPException(status_code=400, detail="Invalid mode. Use 0 or 1")
+            return "❌ Invalid mode, must be 0 or 1"
+
+        return a
     except Exception as e:
-        return QueryResponse(status="error",
-                             message="An error occurred during processing",
-                             error=str(e))
+        return f"❌ Error: {e}"
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
+</file>
+
+<file path="README.md">
+# Agentic-Surfer
+</file>
+
+<file path="requirements.txt">
+llmlingua
+torch>=2.1.0
+transformers>=4.35.0
+accelerate>=0.24.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+</file>
+
+<file path="frontend/src/SpeechStudio.jsx">
+import React, { useState, useRef, useEffect } from "react";
+import { Canvas, useFrame } from "@react-three/fiber";
+import { Mic, Send } from "lucide-react";
+import * as THREE from "three";
+
+// Particle effect
+function VoiceParticles({ audioData, chatBoxRef }) {
+  const pointsRef = useRef();
+  const particleCount = 600;
+  const positions = useRef(new Float32Array(particleCount * 3));
+  const colors = useRef(new Float32Array(particleCount * 3));
+  const velocities = useRef(new Float32Array(particleCount));
+
+  // Initialize particles
+  useEffect(() => {
+    const chatBox = chatBoxRef.current;
+    const rect = chatBox?.getBoundingClientRect() || { bottom: 0 };
+    const startY = (rect.bottom / window.innerHeight) * 5 - 2.5;
+
+    for (let i = 0; i < particleCount; i++) {
+      positions.current[i * 3] = (Math.random() - 0.5) * 6;
+      positions.current[i * 3 + 1] = startY;
+      positions.current[i * 3 + 2] = (Math.random() - 0.5) * 1;
+      velocities.current[i] = 0.02 + Math.random() * 0.02;
+
+      const color = new THREE.Color();
+      color.setHSL(Math.random(), 1, 0.5);
+      colors.current[i * 3] = color.r;
+      colors.current[i * 3 + 1] = color.g;
+      colors.current[i * 3 + 2] = color.b;
+    }
+  }, [chatBoxRef]);
+
+  useFrame(() => {
+    if (!pointsRef.current) return;
+    const amp = (audioData.current || 0) / 80;
+
+    for (let i = 0; i < particleCount; i++) {
+      const ix = i * 3;
+      positions.current[ix + 1] += velocities.current[i] * (1 + amp * 4);
+      positions.current[ix + 0] += Math.sin(Date.now() * 0.001 + ix) * 0.002;
+      positions.current[ix + 2] += Math.cos(Date.now() * 0.001 + ix) * 0.002;
+
+      if (positions.current[ix + 1] > 5) {
+        const chatBox = chatBoxRef.current;
+        const rect = chatBox?.getBoundingClientRect() || { bottom: 0 };
+        positions.current[ix + 1] = (rect.bottom / window.innerHeight) * 5 - 2.5;
+        positions.current[ix + 0] = (Math.random() - 0.5) * 6;
+        positions.current[ix + 2] = (Math.random() - 0.5) * 1;
+      }
+    }
+
+    pointsRef.current.geometry.attributes.position.needsUpdate = true;
+  });
+
+  return (
+    <points ref={pointsRef}>
+      <bufferGeometry>
+        <bufferAttribute
+          attach="attributes-position"
+          count={particleCount}
+          array={positions.current}
+          itemSize={3}
+        />
+        <bufferAttribute
+          attach="attributes-color"
+          count={particleCount}
+          array={colors.current}
+          itemSize={3}
+        />
+      </bufferGeometry>
+      <pointsMaterial vertexColors size={0.15} transparent opacity={0.9} />
+    </points>
+  );
+}
+
+export default function SpeechStudio() {
+  const [text, setText] = useState("");
+  const [messages, setMessages] = useState([]);
+  const [lang, setLang] = useState("en-US");
+  const audioData = useRef(0);
+  const chatBoxRef = useRef();
+
+  // Microphone & audio analyser
+  useEffect(() => {
+    async function initMic() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const source = audioCtx.createMediaStreamSource(stream);
+        const analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+        const updateAudio = () => {
+          analyser.getByteFrequencyData(dataArray);
+          audioData.current = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+          requestAnimationFrame(updateAudio);
+        };
+        updateAudio();
+      } catch {
+        alert("Allow microphone access for live particle effects.");
+      }
+    }
+    initMic();
+  }, []);
+
+  const speakText = (message) => {
+    const ttsLang = lang === "bho-IN" ? "hi-IN" : lang;
+    const utter = new SpeechSynthesisUtterance(message);
+    utter.lang = ttsLang;
+    const voices = window.speechSynthesis.getVoices();
+    const voice = voices.find((v) => v.lang === ttsLang);
+    if (voice) utter.voice = voice;
+    window.speechSynthesis.cancel();
+    window.speechSynthesis.speak(utter);
+  };
+
+  // ✅ Backend call
+  const sendToBackend = async (query) => {
+    try {
+      const res = await fetch("http://127.0.0.1:8000/query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode:1,query: query }),
+      });
+      const data = await res.json();
+      print(data)
+      const reply = typeof data.reply === "string" ? data.reply : JSON.stringify(data.reply);
+      setMessages((prev) => [...prev, { role: "bot", content: reply }]);
+      speakText(reply);
+    } catch (err) {
+      console.error("Error:", err);
+      setMessages((prev) => [...prev, { role: "bot", content: "❌ Backend error" }]);
+    }
+  };
+
+  const handleSend = () => {
+    if (!text.trim()) return;
+    const userMessage = text;
+    setMessages((prev) => [...prev, { role: "user", content: userMessage }]);
+    setText("");
+    sendToBackend(userMessage);
+  };
+
+  const startRecognition = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return alert("Speech recognition not supported.");
+    const recog = new SpeechRecognition();
+    recog.continuous = false;
+    recog.interimResults = false;
+    recog.lang = lang;
+    recog.onresult = (e) => {
+      const transcript = e.results[0][0].transcript;
+      setMessages((prev) => [...prev, { role: "user", content: transcript }]);
+      sendToBackend(transcript);
+    };
+    recog.start();
+  };
+
+  return (
+    <div className="min-h-screen relative bg-gray-900 flex flex-col items-center justify-center p-6 overflow-hidden">
+      {/* Chat UI */}
+      <div
+        ref={chatBoxRef}
+        className="w-full max-w-2xl bg-white rounded-3xl shadow-xl flex flex-col overflow-hidden border border-gray-200 mb-6 z-10 relative"
+      >
+        <div className="flex-1 p-4 overflow-y-auto max-h-96 space-y-3">
+          {messages.length === 0 && <p className="text-gray-400 text-center">No messages yet...</p>}
+          {messages.map((m, i) => (
+            <div
+              key={i}
+              className={`px-4 py-2 rounded-lg max-w-xs break-words ${
+                m.role === "user"
+                  ? "bg-indigo-600 text-white self-end ml-auto"
+                  : "bg-gray-200 text-gray-900 self-start"
+              }`}
+            >
+              {m.content}
+            </div>
+          ))}
+        </div>
+
+        <div className="flex items-center gap-2 p-3 border-t bg-gray-50">
+          <select
+            value={lang}
+            onChange={(e) => setLang(e.target.value)}
+            className="px-3 py-1 rounded-xl border text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400"
+          >
+            <option value="en-US">English (US)</option>
+            <option value="hi-IN">Hindi</option>
+            <option value="bho-IN">Bhojpuri</option>
+          </select>
+
+          <input
+            type="text"
+            placeholder="Type a message..."
+            className="flex-1 px-4 py-2 rounded-2xl bg-gray-100 border border-gray-300 focus:outline-none focus:ring-2 focus:ring-indigo-400"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && handleSend()}
+          />
+
+          <button
+            onClick={handleSend}
+            className="p-3 rounded-full bg-indigo-600 hover:bg-indigo-500 text-white transition-transform transform hover:scale-105"
+          >
+            <Send size={20} />
+          </button>
+
+          <button
+            onClick={startRecognition}
+            className="p-3 rounded-full bg-green-600 hover:bg-green-500 text-white transition-transform transform hover:scale-105"
+          >
+            <Mic size={20} />
+          </button>
+        </div>
+      </div>
+
+      {/* Particle Canvas */}
+      <Canvas
+        className="absolute top-0 left-0 w-full h-full -z-0 pointer-events-none"
+        camera={{ position: [0, 0, 10], fov: 50 }}
+      >
+        <VoiceParticles audioData={audioData} chatBoxRef={chatBoxRef} />
+      </Canvas>
+    </div>
+  );
+}
 </file>
 
 <file path=".gitignore">
@@ -2217,7 +1721,7 @@ __pycache__/
 
 # C extensions
 *.so
-
+repomix-output.xml
 # Distribution / packaging
 .Python
 build/
@@ -2419,6 +1923,196 @@ marimo/_lsp/
 __marimo__/
 </file>
 
+<file path="helper.py">
+import asyncio
+import requests
+import json
+from playwright.sync_api import sync_playwright
+import time
+import random
+import re
+class Helper():
+    def __init__(self):
+        self.playwright = sync_playwright().start()
+        self.browser = self.playwright.chromium.launch(
+            headless=False,
+            args=[
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=VizDisplayCompositor',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding'
+            ]
+        )
+        user_agents = [
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ]
+        self.context = self.browser.new_context(
+            viewport={"width": 1366, "height": 768},
+            user_agent=random.choice(user_agents),
+            extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "DNT": "1",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            }
+        )
+        self.page = self.context.new_page()
+        self.page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined,
+            })
+        """)
+    def save_results(self):
+        try:
+            with open("results_log.txt", "a") as f:
+                f.write(f"URL: {self.page.url}\n")
+                f.write(f"Title: {self.page.title()}\n")
+                f.write(f"Content Preview: {self.extract_visible_content()[:500]}\n")
+                f.write("="*50 + "\n")
+            return "Results saved to results_log.txt"
+        except Exception as e:
+            return f"Error saving results: {e}"
+    def human_like_delay(self, min_sec=1, max_sec=4):
+        base_delay = random.uniform(min_sec, max_sec)
+        chunks = max(1, int(base_delay))
+        for _ in range(chunks):
+            time.sleep(base_delay / chunks)
+            if random.random() > 0.7:
+                time.sleep(random.uniform(0.1, 0.3))
+
+    def human_like_mouse_movement(self):
+        try:
+
+            for _ in range(3):
+                x = random.randint(100, 1200)
+                y = random.randint(100, 600)
+                self.page.mouse.move(x, y)
+                time.sleep(0.2)
+        except:
+            pass
+    
+    def search_google_safely(self, query: str):
+        try:
+            print(f"🔍 Searching for: {query}")
+            self.page.goto("https://www.wikipedia.org", wait_until="networkidle")
+            self.human_like_delay(1, 2)
+            self.page.goto("https://www.google.com", wait_until="networkidle")
+            self.human_like_delay(1, 3)
+            search_box = "textarea[name='q'], input[name='q']"
+            self.page.wait_for_selector(search_box, timeout=10000)
+            self.page.click(search_box)
+            self.human_like_delay(0.5, 1)
+            for i, char in enumerate(query):
+                self.page.type(search_box, char, delay=random.randint(80, 200))
+                if random.random() > 0.9:
+                    self.human_like_delay(0.1, 0.4)
+                if i % 5 == 0:
+                    self.human_like_mouse_movement()
+            self.human_like_delay(1, 2)
+            self.page.press(search_box, "Enter")
+            self.human_like_delay(1, 4)
+            content = self.page.content().lower()
+            if any(blocked in content for blocked in ["unusual traffic", "detected unusual traffic", "captcha"]):
+                print("🚫 Blocked by Google. Trying alternative approach...")
+                return self.use_alternative_search_engine(query)
+            
+            return self.get_page_info()
+        except Exception as e:
+            return {"error": str(e)}
+    
+    def use_alternative_search_engine(self, query: str):
+        alternatives = [
+            ("https://search.yahoo.com", "input[name='p']"),
+            ("https://duckduckgo.com", "input[name='q']"),
+            ("https://www.bing.com", "input[name='q']"),
+        ]
+        for url, selector in alternatives:
+            try:
+                self.page.goto(url, wait_until="networkidle")
+                self.page.fill(selector, query)
+                self.page.press(selector, "Enter")
+                return self.get_page_info()
+            except:
+                continue
+        return {"error": "All search engines blocked"}
+    
+    def smart_click(self, target: str):
+        strategies = [
+            f"a:has-text('{target}')",
+            f"h3:has-text('{target}')",
+            f"div:has-text('{target}')",
+            f"span:has-text('{target}')",
+            f"button:has-text('{target}')",
+            f"a:has-text(/:.*{target}.*/i)",
+            f"h3:has-text(/:.*{target}.*/i)",
+        ]
+        
+        for selector in strategies:
+            try:
+                if self.page.locator(selector).count() > 0:
+                    self.human_like_mouse_movement()
+                    self.page.click(selector)
+                    self.human_like_delay(1, 2)
+                    if self.page.url != self.page.context.pages[0].url:
+                        return self.get_page_info()
+            except:
+                continue
+        return "Click failed - element not found"
+
+    def extract_visible_content(self):
+        try:
+            content = self.page.evaluate("""
+                () => {
+                    const elementsToRemove = document.querySelectorAll('script, style, nav, footer, header');
+                    elementsToRemove.forEach(el => el.remove());
+                    return document.body.innerText;
+                }
+            """)
+            lines = [line.strip() for line in content.split('\n') if line.strip()]
+            clean_content = '\n'.join(lines[:100])
+            return clean_content[:2000]
+        except Exception as e:
+            return f"Extraction error: {e}" 
+    def get_page_info(self):
+        try:
+            return {
+                "url": self.page.url,
+                "title": self.page.title(),
+                "content_preview": self.extract_visible_content()[:500]
+            }
+        except:
+            return {"error": "Could not get page info"}
+    
+    def close(self):
+        self.browser.close()
+        self.playwright.stop()
+
+    def clear_cookies_and_cache(self):
+        """Clear cookies and cache between sessions"""
+        try:
+            self.context.clear_cookies()
+            # Add storage cleanup if needed
+            self.page.evaluate("() => localStorage.clear()")
+            self.page.evaluate("() => sessionStorage.clear()")
+        except:
+            pass
+
+    def rotate_user_agent(self):
+        """Rotate user agent for new sessions"""
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
+        ]
+        new_agent = random.choice(user_agents)
+        self.context.set_extra_http_headers({'User-Agent': new_agent})
+</file>
+
 <file path="agent.py">
 import ollama
 import re
@@ -2429,7 +2123,7 @@ class mainLLM:
     
     def call_llm(self, prompt: str):
         try:
-            response = ollama.generate(model=self.model, prompt="prompt")
+            response = ollama.generate(model=self.model, prompt=prompt)
             result = response['response']
             return result
         except Exception as e:
@@ -2481,6 +2175,9 @@ class mainLLM:
         - Resutls we have by browsing the web: {content[:1500]}
         - This will be the last output that will be directly given to the user based on the question and the response collected from the web.
           so make sure you create proper json out of this thing okay.
+          The content in the json structure result field should be humanized properly okay 
+          so the structure is{{"input":{original_goal}, "output":{content[:500]}(should be properly humanized dont provide unstructured data please)}}
+        - Please dont write anythign else in the ouput i just want you to give me the json  with input and output field the output must be humanized as per the resutls obtained from the web
         """
         #return 
         return self.call_llm(prompt)
