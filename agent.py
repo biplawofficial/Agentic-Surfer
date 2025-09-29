@@ -54,18 +54,14 @@ class mainLLM:
     def extract_final_data(self, content: str, original_goal: str):
         """Final call to extract structured data"""
         prompt = f"""
-        - You are an very useful agent that gives humanized and summarised outputs to users based on the contents provided as results.
+        - You are an very useful agent that gives structured outputs as strict json structure to users.
         - Prompt by user (Original goal): {original_goal}
         - Resutls we have by browsing the web: {content[:1500]}
         - This will be the last output that will be directly given to the user based on the question and the response collected from the web.
-          The content in the text format, results should be humanized properly okay 
-        - It should be point to point nothing extra needed just what is asked in as short as possible but everythign should be clear 
-        - eg : - iphone 12 listed on amazon for price 20,000 INR 
-               - Top 5 phones on amazon below 10000 are 
-                - samsung m12
-                - vivo k20
-                -... etc
-        - and please summarize it and write in your own ways please filter out unnecessary symbols like phone/moto//% filter those please
-         """
+          so make sure you create proper json out of this thing okay.
+          The content in the json structure result field should be humanized properly okay 
+          so the structure is{{"input":{original_goal}, "output":{content[:500]}(should be properly humanized dont provide unstructured data please)}}
+        - Please dont write anythign else in the ouput i just want you to give me the json  with input and output field the output must be humanized as per the resutls obtained from the web
+        """
         #return 
         return self.call_llm(prompt)

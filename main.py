@@ -16,11 +16,14 @@ from browser_use import Agent, BrowserProfile
 from browser_use import ChatOllama
 from compressor import Compressor
 
+
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI
 from pydantic import BaseModel
 import io
 import contextlib
+
 
 app = FastAPI()
 
@@ -33,6 +36,7 @@ app.add_middleware(
     allow_methods=["*"],    # POST, GET, OPTIONS sab allow
     allow_headers=["*"],    # sab headers allow
 )
+
 
 class SimpleAgent(Helper):
     def __init__(self):
@@ -123,7 +127,7 @@ def single(input_query):
             else:
                 results_str = "\n".join([f"Step {r['index']} : {r['result']}" for r in results])
                 final_response = mainllm.extract_final_data( results_str, input_query)
-                # final_response = agent.parse_json(final_response)
+                final_response = agent.parse_json(final_response)
                 print(final_response)
                 return(final_response)
         except Exception as e:
@@ -139,20 +143,14 @@ async def multi(task):
     browser_profile = BrowserProfile(
         minimum_wait_page_load_time=0.1,
         wait_between_actions=0.1,
-        headless=False,
+        headless=True,
     )
     compressor=Compressor()
     print(f"Compressed Task: {compressor.compress_prompt(task)}")
     task+=(f"""
-           - results in humanized format Use google to check relevance and up to date info.
-             The content in the text format, results should be humanized properly okay 
-        - It should be point to point nothing extra needed just what is asked in as short as possible but everythign should be clear 
-        - eg : - iphone 12 listed on amazon for price 20,000 INR 
-               - Top 5 phones on amazon below 10000 are 
-                - samsung m12
-                - vivo k20
-                -... etc
-        - and please summarize it and write in your own ways please filter out unnecessary symbols like phone/moto//% filter those please
+           - results in strict JSON format, no text I just strictly need JSON Outputs, Use google to check relevance and up to date info.
+           - so the structure is{{"input":{task}, "output":{"results obtained from the web"}(should be properly humanized dont provide unstructured data please)}}
+           - Please dont write anythign else in the ouput i just want you to give me the json  with input and output field the output must be humanized as per the resutls obtained from the web
            """)
     agent = Agent(
         task=task,
@@ -164,7 +162,6 @@ async def multi(task):
     history = history.extracted_content()[-1]
     history = json.loads(history)
     return history
-app = FastAPI()
 
 class QueryRequest(BaseModel):
     query: str
@@ -181,17 +178,8 @@ def handle_query(request: QueryRequest):
             a=asyncio.run(multi(request.query))
         else:
             return "❌ Invalid mode, must be 0 or 1"
-        a=a.replace('/',"")
-        a=a.replace("\",")
-        a=a.replace("-\",")
-        a=a.replace("-/","")
-        a=a.replace("**"," ")
-        finalresult={
-            "output":a
-            }
-        finalresult=json.dumps(finalresult)
-        print(finalresult)
-        return finalresult
+
+        return a
     except Exception as e:
         return f"❌ Error: {e}"
 
