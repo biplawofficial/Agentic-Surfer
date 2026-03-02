@@ -1,6 +1,6 @@
 # 🌐 Agentic-Surfer
 
-An AI agent that opens a real browser, navigates the web, and completes tasks autonomously — just give it a natural-language query.
+An AI agent that opens a real browser(Chrome), navigates the web, and completes tasks autonomously — just give it a natural-language query.
 
 ## How It Works
 
